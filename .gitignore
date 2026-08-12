@@ -1,0 +1,13 @@
+# 构建产物
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.manifest
+
+# 用户配置（含指针路径，勿入库）
+*.cfg
+
+# 其他
+*.bak
+Thumbs.db
