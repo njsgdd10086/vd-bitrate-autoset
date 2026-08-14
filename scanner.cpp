@@ -26,8 +26,11 @@ bool EnableDebugPrivilege()
     tp.PrivilegeCount           = 1;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
     AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    const DWORD err = GetLastError();
     CloseHandle(hToken);
-    return true;
+    // 非管理员会返回 ERROR_NOT_ALL_ASSIGNED(属预期)：同用户进程无需该特权即可附加。
+    // 这里只返回是否真正启用，供调用方判断；附加失败时 main.cpp 会给出权限提示。
+    return err == ERROR_SUCCESS;
 }
 
 uintptr_t ParseNum(const std::wstring& s)
@@ -137,6 +140,10 @@ void VdScanner::CollectModules()
         moduleSize_ = modules_[0].size;
         moduleName_ = modules_[0].name;
     }
+
+    // 按基址排序，后续 ModuleAt / 区域重叠判定用二分查找
+    std::sort(modules_.begin(), modules_.end(),
+              [](const ModInfo& a, const ModInfo& b) { return a.base < b.base; });
 }
 
 void VdScanner::CollectRegions()
@@ -166,15 +173,23 @@ void VdScanner::CollectRegions()
 
 const VdScanner::ModInfo* VdScanner::ModuleAt(uintptr_t addr) const
 {
-    for (const auto& m : modules_)
-        if (addr >= m.base && addr < m.base + m.size)
-            return &m;
+    // modules_ 已按 base 排序，二分定位包含 addr 的模块
+    auto it = std::upper_bound(modules_.begin(), modules_.end(), addr,
+        [](uintptr_t a, const ModInfo& m) { return a < m.base; });
+    if (it == modules_.begin())
+        return nullptr;
+    --it;
+    if (addr < it->base + it->size)
+        return &(*it);
     return nullptr;
 }
 
-std::vector<ScanMatch> VdScanner::ScanValue(uint32_t value) const
+std::vector<ScanMatch> VdScanner::ScanValue(uint32_t value, size_t maxResults,
+                                            bool* truncated) const
 {
     std::vector<ScanMatch> out;
+    if (truncated)
+        *truncated = false;
     std::vector<uint8_t> buf(64 * 1024);
     for (const Region& r : regions_) {
         for (SIZE_T off = 0; off < r.size; off += buf.size()) {
@@ -186,8 +201,14 @@ std::vector<ScanMatch> VdScanner::ScanValue(uint32_t value) const
             for (SIZE_T i = 0; i + 3 < rd; ++i) {
                 uint32_t v = 0;
                 std::memcpy(&v, buf.data() + i, sizeof(v));
-                if (v == value)
+                if (v == value) {
                     out.push_back({ r.base + off + i, v });
+                    if (maxResults && out.size() >= maxResults) {
+                        if (truncated)
+                            *truncated = true;
+                        return out;
+                    }
+                }
             }
         }
     }
@@ -226,15 +247,19 @@ std::vector<PtrPath> VdScanner::FindPointerPaths(uintptr_t leaf, int maxDepth,
     std::vector<uint8_t> buf(64 * 1024);
     const ULONGLONG t0 = GetTickCount64();
 
-    // 标记哪些区域属于模块映像——优先扫它们(根指针一定在模块里)
+    // 标记哪些区域属于模块映像——优先扫它们(根指针一定在模块里)。
+    // modules_ 已按 base 排序，用二分判断区域是否与任一模块重叠。
     std::vector<uint8_t> inModule(regions_.size(), 0);
     for (size_t ri = 0; ri < regions_.size(); ++ri) {
         const Region& r = regions_[ri];
-        for (const auto& m : modules_) {
-            if (r.base < m.base + m.size && r.base + r.size > m.base) {
+        auto it = std::lower_bound(modules_.begin(), modules_.end(), r.base,
+            [](const ModInfo& m, uintptr_t a) { return m.base < a; });
+        if (it != modules_.end() && it->base < r.base + r.size) {
+            inModule[ri] = 1;
+        } else if (it != modules_.begin()) {
+            --it;
+            if (r.base < it->base + it->size)
                 inModule[ri] = 1;
-                break;
-            }
         }
     }
 
@@ -244,39 +269,41 @@ std::vector<PtrPath> VdScanner::FindPointerPaths(uintptr_t leaf, int maxDepth,
                    static_cast<ULONGLONG>(timeLimitMs);
     };
 
+    // 单趟多目标：每个区域每层只读一遍，同时匹配所有目标节点(受 maxNodes 上限，
+    // 目标数通常 ≤8)，相比"逐节点全量重扫"可减少数倍的 ReadProcessMemory。
     for (int depth = 1; depth <= maxDepth && !targets.empty(); ++depth) {
         if (progress)
             progress(progressCtx, depth, targets.size(),
                      static_cast<DWORD>(GetTickCount64() - t0));
         std::vector<Node> next;
-        for (const Node& t : targets) {
-            const uintptr_t lo = (t.loc > kMaxOff) ? t.loc - kMaxOff : 0;
-            const uintptr_t hi = t.loc;
-            // 先扫模块区域(快，根路径尽早出现)，再扫其余内存找更多候选
-            for (int pass = 0; pass < 2 && !overBudget(); ++pass) {
-                for (size_t ri = 0; ri < regions_.size(); ++ri) {
-                    if ((inModule[ri] != 0) != (pass == 0))
+        for (int pass = 0; pass < 2 && !overBudget(); ++pass) {
+            for (size_t ri = 0; ri < regions_.size() && !overBudget(); ++ri) {
+                if ((inModule[ri] != 0) != (pass == 0))
+                    continue;
+                const Region& r = regions_[ri];
+                for (SIZE_T off = 0; off < r.size && !overBudget();
+                     off += buf.size()) {
+                    const SIZE_T n = (std::min)(buf.size(), r.size - off);
+                    SIZE_T rd = 0;
+                    if (!ReadProcessMemory(h_,
+                                           reinterpret_cast<LPCVOID>(r.base + off),
+                                           buf.data(), n, &rd) || rd < 8)
                         continue;
-                    const Region& r = regions_[ri];
-                    for (SIZE_T off = 0; off < r.size; off += buf.size()) {
-                        if (overBudget())
-                            return result;
-                        const SIZE_T n = (std::min)(buf.size(), r.size - off);
-                        SIZE_T rd = 0;
-                        if (!ReadProcessMemory(h_,
-                                               reinterpret_cast<LPCVOID>(r.base + off),
-                                               buf.data(), n, &rd) || rd < 8)
+                    // x64 下指针按 8 字节对齐存储，按对齐步进可省约 8 倍比较，
+                    // 并避免大量未对齐假候选逐层放大。
+                    for (SIZE_T i = 0; i + 7 < rd; i += 8) {
+                        uintptr_t q = 0;
+                        std::memcpy(&q, buf.data() + i, sizeof(q));
+                        const uintptr_t loc = r.base + off + i;
+                        if (visited.count(loc))
                             continue;
-                        for (SIZE_T i = 0; i + 7 < rd; ++i) {
-                            uintptr_t q = 0;
-                            std::memcpy(&q, buf.data() + i, sizeof(q));
-                            if (q < lo || q > hi)
+                        bool matched = false;
+                        for (const Node& t : targets) {
+                            const uintptr_t lo =
+                                (t.loc > kMaxOff) ? t.loc - kMaxOff : 0;
+                            if (q < lo || q > t.loc)
                                 continue;
-                            const uintptr_t loc = r.base + off + i;
-                            if (visited.count(loc))
-                                continue;
-                            visited.insert(loc);
-
+                            matched = true;
                             const uintptr_t gap = t.loc - q;
                             std::vector<uintptr_t> hops;
                             hops.reserve(t.hops.size() + 1);
@@ -294,6 +321,8 @@ std::vector<PtrPath> VdScanner::FindPointerPaths(uintptr_t leaf, int maxDepth,
                                 next.push_back({ loc, std::move(hops) });
                             }
                         }
+                        if (matched)
+                            visited.insert(loc);
                     }
                 }
             }

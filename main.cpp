@@ -1,4 +1,4 @@
-﻿// vd-bitrate-autoset GUI v3
+// vd-bitrate-autoset GUI v3
 // - 自绘暗色现代 UI（无边框圆角窗口、自定义标题栏、悬停反馈按钮）
 // - 三步差分定位 + 指针路径生成 + 常驻托盘
 // - 监控按钮三态：待机 / 监控中 / 休眠；修改完成后自动休眠，
@@ -29,6 +29,7 @@
 #include <uxtheme.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -91,7 +92,11 @@ enum {
     IDC_LOG,
     IDC_CHK_NOSLEEP,
     IDC_CHK_POPUP,
+    IDC_LBL_WARN,
 };
+
+// 单次扫描/全量修改的结果上限，防止数值过于常见时 UI 卡死
+constexpr size_t kMaxScanResults = 1000000;
 
 constexpr UINT WM_TRAY   = WM_APP + 10;
 constexpr UINT WM_LOGMSG = WM_APP + 1;
@@ -112,13 +117,9 @@ struct AppState {
     HFONT statusFont = nullptr;
     HICON appIcon = nullptr;
     HBRUSH bgBrush = nullptr;
-    HBRUSH cardBrush = nullptr;
     HBRUSH inputBrush = nullptr;
-    HBRUSH accentBrush = nullptr;
 
     double scale = 1.0;   // DPI 缩放因子 (dpi/96)
-    int ww = kW;          // 实际窗口宽(像素)
-    int wh = kH;          // 实际窗口高(像素)
 
     bool hovMin = false;
     bool hovClose = false;
@@ -132,15 +133,18 @@ struct AppState {
 
     HANDLE monitorThread = nullptr;
     HANDLE stopEvent     = nullptr;
+    HANDLE jobThread     = nullptr;
     MonState monState     = MonState::Standby;
     bool realExit         = false;
     bool jobBusy          = false;
-    bool noSleepAfter     = true;   // 修改后自动休眠(关掉则继续监控, 有被EAC检测风险)
+    bool autoSleep        = true;   // 修改后自动休眠(勾选; 关闭则继续监控, 有被EAC检测风险)
     bool popupAfter       = true;   // 修改后自动弹出主窗口
     HFONT smallFont       = nullptr;
+    std::atomic<bool> exiting{false};  // 真正退出标志(后台任务据此自查自删)
 };
 
 AppState g;
+std::wstring g_cfgDir;  // 解析后的配置目录(exe 同目录不可写时回退到 %APPDATA%)
 
 // 按 DPI 缩放设计坐标
 #define S(v) static_cast<int>((v) * g.scale)
@@ -179,6 +183,21 @@ bool IsSteamVrRunning()
     return false;
 }
 
+// 校验码率输入：仅允许 1 ~ 4294967295 的十进制整数(0 会让扫描命中全内存)
+bool ParseBitrate(const std::wstring& s, DWORD* out)
+{
+    if (s.empty())
+        return false;
+    for (wchar_t c : s)
+        if (c < L'0' || c > L'9')
+            return false;
+    const unsigned long long v = wcstoull(s.c_str(), nullptr, 10);
+    if (v == 0 || v > 0xFFFFFFFFull)
+        return false;
+    *out = static_cast<DWORD>(v);
+    return true;
+}
+
 void Log(const wchar_t* fmt, ...)
 {
     wchar_t buf[1024];
@@ -211,8 +230,6 @@ void InvalidatePill()
 
 // ---------- 暗色模式 ----------
 
-bool g_dark = false;
-
 void InitDarkMode()
 {
     HMODULE ux = LoadLibraryW(L"uxtheme.dll");
@@ -222,13 +239,11 @@ void InitDarkMode()
     using AllowApp = BOOL(WINAPI*)(BOOL);
     auto pref  = reinterpret_cast<SetPref>(GetProcAddress(ux, "SetPreferredAppMode"));
     auto allow = reinterpret_cast<AllowApp>(GetProcAddress(ux, "AllowDarkModeForApp"));
-    if (pref) {
+    if (pref)
         pref(2);
-        g_dark = true;
-    } else if (allow) {
+    else if (allow)
         allow(TRUE);
-        g_dark = true;
-    }
+    FreeLibrary(ux);
 }
 
 // ---------- 图标 ----------
@@ -249,6 +264,12 @@ HICON CreateAppIcon(const wchar_t* text)
     HBITMAP hbm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     HDC mem = CreateCompatibleDC(dc);
     HGDIOBJ oldBmp = SelectObject(mem, hbm);
+
+    // 32bpp BI_RGB 位图的 alpha 通道默认为 0(全透明)，需显式设为不透明，
+    // 否则 CreateIconIndirect 生成的托盘图标会渲染成全黑/不可见。
+    uint8_t* px = static_cast<uint8_t*>(bits);
+    for (int i = 0; i < size * size; ++i)
+        px[i * 4 + 3] = 0xFF;
 
     HBRUSH bg = CreateSolidBrush(kAccent);
     RECT rc{ 0, 0, size, size };
@@ -289,6 +310,8 @@ void AddTrayIcon()
     nid.hIcon = g.appIcon;
     wcsncpy_s(nid.szTip, L"VD码率修改器 - 双击显示窗口", _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD, &nid);
+    nid.uVersion = NOTIFYICON_VERSION_4;  // 启用 Win10 现代托盘行为/气泡
+    Shell_NotifyIconW(NIM_SETVERSION, &nid);
 }
 
 void TrayBalloon(const wchar_t* info)
@@ -339,7 +362,7 @@ HWND MakeButton(HWND parent, int id, const wchar_t* text, int x, int y,
                              WS_CHILD | WS_VISIBLE | WS_TABSTOP |
                                  BS_OWNERDRAW,
                              x, y, w, h, parent,
-                             reinterpret_cast<HMENU>(id), g.hInst, nullptr);
+                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g.hInst, nullptr);
     auto* bd = new ButtonData{ bg, hover, down, kText };
     SetWindowSubclass(b, ButtonSubclass, 0,
                       reinterpret_cast<DWORD_PTR>(bd));
@@ -418,7 +441,7 @@ HWND MakeCheckbox(HWND parent, int id, const wchar_t* text, int x, int y,
                              WS_CHILD | WS_VISIBLE | WS_TABSTOP |
                                  BS_AUTOCHECKBOX,
                              x, y, w, h, parent,
-                             reinterpret_cast<HMENU>(id), g.hInst, nullptr);
+                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g.hInst, nullptr);
     SetWindowSubclass(b, CheckboxSubclass, 0, 0);
     SendMessageW(b, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
     return b;
@@ -486,7 +509,7 @@ HWND MakeEdit(HWND parent, int id, int x, int y, int w, int h,
                              WS_CHILD | WS_VISIBLE | WS_TABSTOP |
                                  ES_AUTOHSCROLL,
                              x, y, w, h, parent,
-                             reinterpret_cast<HMENU>(id), g.hInst, nullptr);
+                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g.hInst, nullptr);
     SetWindowSubclass(e, EditSubclass, 0,
                       reinterpret_cast<DWORD_PTR>(new EditData));
     SendMessageW(e, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
@@ -508,11 +531,13 @@ void SetEditText(int id, const std::wstring& s)
     SetWindowTextW(GetDlgItem(g.hwnd, id), s.c_str());
 }
 
-HWND MakeCaption(HWND parent, const wchar_t* text, int x, int y, int w, int h)
+HWND MakeCaption(HWND parent, const wchar_t* text, int x, int y, int w, int h,
+                 int id = 0)
 {
     HWND c = CreateWindowExW(0, L"STATIC", text,
                              WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
-                             x, y, w, h, parent, nullptr, g.hInst, nullptr);
+                             x, y, w, h, parent,
+                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g.hInst, nullptr);
     SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
     return c;
 }
@@ -559,7 +584,7 @@ HWND MakeList(HWND parent, int id, int x, int y, int w, int h)
                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT |
                                   LVS_SINGLESEL,
                               x, y, w, h, parent,
-                              reinterpret_cast<HMENU>(id), g.hInst, nullptr);
+                              reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g.hInst, nullptr);
     ListView_SetExtendedListViewStyle(lv,
                                       LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES |
                                           LVS_EX_DOUBLEBUFFER);
@@ -664,6 +689,7 @@ struct ScanJob {
     std::vector<PtrPath> outPaths;
     std::wstring outErr;
     int patched = 0;
+    bool truncated = false;   // ScanValue 结果被上限截断
     std::unique_ptr<VdScanner> scanner;
 };
 
@@ -681,15 +707,21 @@ void RunJob(int kind, std::vector<ScanMatch> in = {})
 {
     if (g.jobBusy)
         return;
+    DWORD from = 0, to = 0;
+    if (!ParseBitrate(GetEditText(IDC_EDIT_FROM), &from) ||
+        !ParseBitrate(GetEditText(IDC_EDIT_TO), &to)) {
+        MessageBoxW(g.hwnd, L"from/to 必须是 1 ~ 4294967295 之间的十进制整数。",
+                    L"输入无效", MB_ICONWARNING);
+        return;
+    }
+
     g.jobBusy = true;
     SetJobUi(false);
 
     auto* job = new ScanJob;
     job->kind = kind;
-    job->from = static_cast<DWORD>(
-        wcstoull(GetEditText(IDC_EDIT_FROM).c_str(), nullptr, 10));
-    job->to = static_cast<DWORD>(
-        wcstoull(GetEditText(IDC_EDIT_TO).c_str(), nullptr, 10));
+    job->from = from;
+    job->to = to;
     job->inMatches = std::move(in);
     if (g.scanner)
         job->scanner = std::move(g.scanner);
@@ -698,8 +730,12 @@ void RunJob(int kind, std::vector<ScanMatch> in = {})
     if (!t) {
         g.jobBusy = false;
         SetJobUi(true);
+        if (job->scanner)
+            g.scanner = std::move(job->scanner);  // 创建失败则归还扫描器，避免丢失
         delete job;
+        return;
     }
+    g.jobThread = t;
 }
 
 void PtrScanProgressCb(void* ctx, int depth, size_t candidates, DWORD elapsedMs)
@@ -729,7 +765,8 @@ DWORD WINAPI JobProc(LPVOID lp)
             }
             job->scanner = std::move(sc);
             ThreadLog(g.hwnd, L"已附加 virtualdesktop.streamer.exe，正在全内存扫描...");
-            job->outMatches = job->scanner->ScanValue(job->from);
+            job->outMatches =
+                job->scanner->ScanValue(job->from, kMaxScanResults, &job->truncated);
             break;
         }
         case JOB_CHANGED:
@@ -795,13 +832,18 @@ DWORD WINAPI JobProc(LPVOID lp)
                 }
                 job->scanner = std::move(sc);
             }
-            for (const ScanMatch& m : job->scanner->ScanValue(job->from))
+            for (const ScanMatch& m :
+                 job->scanner->ScanValue(job->from, kMaxScanResults,
+                                         &job->truncated))
                 if (job->scanner->Write32(m.addr, job->to))
                     ++job->patched;
             break;
         }
     }
-    PostMessageW(g.hwnd, WM_JOB, 0, reinterpret_cast<LPARAM>(job));
+    if (g.exiting.load())
+        delete job;
+    else if (!PostMessageW(g.hwnd, WM_JOB, 0, reinterpret_cast<LPARAM>(job)))
+        delete job;   // 窗口已销毁，无法投递结果，自行清理
     return 0;
 }
 
@@ -886,25 +928,65 @@ void DoTestPtr()
 
 // ---------- 配置 ----------
 
-std::wstring CfgPath()
+// 配置目录：优先 exe 同目录；不可写(如 Program Files)时回退到 %APPDATA%
+void ResolveCfgDir()
 {
     wchar_t dir[MAX_PATH]{};
     GetModuleFileNameW(nullptr, dir, MAX_PATH);
     wchar_t* slash = wcsrchr(dir, L'\\');
     if (slash)
         *slash = L'\0';
-    return std::wstring(dir) + L"\\" + kCfgFile;
+    const std::wstring exeDir = dir;
+    const std::wstring exeCfg = exeDir + L"\\" + kCfgFile;
+
+    // 同目录已有配置则沿用
+    if (GetFileAttributesW(exeCfg.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        g_cfgDir = exeDir;
+        return;
+    }
+
+    // 探测 exe 目录可写性
+    HANDLE probe = CreateFileW(exeCfg.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (probe != INVALID_HANDLE_VALUE) {
+        CloseHandle(probe);
+        DeleteFileW(exeCfg.c_str());
+        g_cfgDir = exeDir;
+        return;
+    }
+
+    wchar_t appData[MAX_PATH]{};
+    const DWORD n = GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        std::wstring d = std::wstring(appData) + L"\\vd-bitrate-autoset";
+        CreateDirectoryW(d.c_str(), nullptr);
+        g_cfgDir = d;
+        return;
+    }
+    g_cfgDir = exeDir;  // 兜底
+}
+
+std::wstring CfgPath()
+{
+    return g_cfgDir + L"\\" + kCfgFile;
 }
 
 void SaveConfig()
 {
-    std::wofstream f(CfgPath(), std::ios::out);
+    std::wofstream f(CfgPath(), std::ios::out | std::ios::trunc);
+    if (!f.is_open()) {
+        Log(L"[配置] 保存失败：无法写入 %s", CfgPath().c_str());
+        return;
+    }
     f << L"from=" << g.from << L"\n";
     f << L"to=" << g.to << L"\n";
-    f << L"nosleep=" << (g.noSleepAfter ? 1 : 0) << L"\n";
+    f << L"nosleep=" << (g.autoSleep ? 0 : 1) << L"\n";
     f << L"popup_after=" << (g.popupAfter ? 1 : 0) << L"\n";
     for (const PtrPath& p : g.paths)
         f << L"path=" << p.ToString() << L"\n";
+    f.flush();
+    if (!f.good())
+        Log(L"[配置] 保存失败：写入出错 %s", CfgPath().c_str());
 }
 
 void LoadConfig()
@@ -918,7 +1000,7 @@ void LoadConfig()
         else if (line.rfind(L"to=", 0) == 0)
             g.to = static_cast<DWORD>(wcstoull(line.c_str() + 3, nullptr, 10));
         else if (line.rfind(L"nosleep=", 0) == 0)
-            g.noSleepAfter = _wtoi(line.c_str() + 8) != 0;
+            g.autoSleep = _wtoi(line.c_str() + 8) == 0;
         else if (line.rfind(L"popup_after=", 0) == 0)
             g.popupAfter = _wtoi(line.c_str() + 12) != 0;
         else if (line.rfind(L"path=", 0) == 0) {
@@ -931,7 +1013,7 @@ void LoadConfig()
     SetEditText(IDC_EDIT_FROM, std::to_wstring(g.from));
     SetEditText(IDC_EDIT_TO, std::to_wstring(g.to));
     SendMessageW(GetDlgItem(g.hwnd, IDC_CHK_NOSLEEP), BM_SETCHECK,
-                 g.noSleepAfter ? BST_CHECKED : BST_UNCHECKED, 0);
+                 g.autoSleep ? BST_CHECKED : BST_UNCHECKED, 0);
     InvalidateRect(GetDlgItem(g.hwnd, IDC_CHK_NOSLEEP), nullptr, TRUE);
     SendMessageW(GetDlgItem(g.hwnd, IDC_CHK_POPUP), BM_SETCHECK,
                  g.popupAfter ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -948,8 +1030,8 @@ struct MonitorCtx {
     HWND hwnd;
     HANDLE stop;
     std::vector<PtrPath> paths;
-    bool noSleep = false;
-    bool popup   = false;
+    bool sleep = true;
+    bool popup  = false;
 };
 
 DWORD WINAPI MonitorProc(LPVOID lp)
@@ -981,15 +1063,15 @@ DWORD WINAPI MonitorProc(LPVOID lp)
                     ThreadLog(ctx->hwnd, msg);
                     if (ctx->popup)
                         PostMessageW(ctx->hwnd, WM_SHOW, 0, 0);
-                    if (ctx->noSleep) {
-                        ThreadLog(ctx->hwnd, L"[监控] 已开启「修改后不休眠」: "
-                                    L"继续监听, 下次 SteamVR 启动会再次修改");
-                    } else {
+                    if (ctx->sleep) {
                         // 修改完成 → 自动休眠
                         wchar_t* sleepMsg = _wcsdup(msg);
                         if (sleepMsg)
                             PostMessageW(ctx->hwnd, WM_SLEEP, 0,
                                          reinterpret_cast<LPARAM>(sleepMsg));
+                    } else {
+                        ThreadLog(ctx->hwnd, L"[监控] 已开启「修改后不休眠」: "
+                                    L"继续监听, 下次 SteamVR 启动会再次修改");
                     }
                 }
             }
@@ -998,6 +1080,7 @@ DWORD WINAPI MonitorProc(LPVOID lp)
             patched = false;
         }
     }
+    CloseHandle(ctx->stop);
     delete ctx;
     return 0;
 }
@@ -1006,12 +1089,10 @@ void StopMonitor()
 {
     if (!g.monitorThread)
         return;
-    SetEvent(g.stopEvent);
-    WaitForSingleObject(g.monitorThread, 5000);
-    CloseHandle(g.monitorThread);
+    SetEvent(g.stopEvent);        // 通知监控线程退出
+    CloseHandle(g.monitorThread); // 分离：不阻塞 UI，线程退出后自行清理
     g.monitorThread = nullptr;
-    CloseHandle(g.stopEvent);
-    g.stopEvent = nullptr;
+    g.stopEvent = nullptr;        // 事件句柄由监控线程在退出时关闭，避免句柄复用竞态
 }
 
 void ArmMonitor()
@@ -1024,23 +1105,32 @@ void ArmMonitor()
                     L"提示", MB_ICONINFORMATION);
         return;
     }
-    g.from = static_cast<DWORD>(
-        wcstoull(GetEditText(IDC_EDIT_FROM).c_str(), nullptr, 10));
-    g.to = static_cast<DWORD>(
-        wcstoull(GetEditText(IDC_EDIT_TO).c_str(), nullptr, 10));
+    if (!ParseBitrate(GetEditText(IDC_EDIT_FROM), &g.from) ||
+        !ParseBitrate(GetEditText(IDC_EDIT_TO), &g.to)) {
+        MessageBoxW(g.hwnd, L"from/to 必须是 1 ~ 4294967295 之间的十进制整数。",
+                    L"输入无效", MB_ICONWARNING);
+        return;
+    }
 
     auto* ctx = new MonitorCtx{ g.from, g.to, g.hwnd, nullptr, g.paths,
-                                g.noSleepAfter, g.popupAfter };
+                                g.autoSleep, g.popupAfter };
     g.stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     ctx->stop = g.stopEvent;
     g.monitorThread = CreateThread(nullptr, 0, MonitorProc, ctx, 0, nullptr);
+    if (!g.monitorThread) {
+        CloseHandle(g.stopEvent);
+        g.stopEvent = nullptr;
+        delete ctx;
+        MessageBoxW(g.hwnd, L"无法创建监控线程。", L"错误", MB_ICONERROR);
+        return;
+    }
     g.monState = MonState::Armed;
     UpdateMonitorButton();
     InvalidatePill();
     SaveConfig();
     Log(L"[监控] 已开始: SteamVR 启动时自动把 %lu -> %lu，%s",
         g.from, g.to,
-        g.noSleepAfter ? L"修改完成后自动休眠" : L"修改后不休眠(继续监控)");
+        g.autoSleep ? L"修改完成后自动休眠" : L"修改后不休眠(继续监控)");
 }
 
 void ToggleMonitor()
@@ -1056,7 +1146,7 @@ void ToggleMonitor()
     }
 }
 
-void OnAutoSleep(HWND hwnd, wchar_t* text)
+void OnAutoSleep(wchar_t* text)
 {
     if (text) {
         Log(L"%s", text);
@@ -1136,6 +1226,85 @@ void DrawStatusPill(HDC dc)
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
+// ---------- 字体与 DPI ----------
+
+void CreateFonts()
+{
+    g.font = CreateFontW(S(-15), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
+                         FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                         CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                         DEFAULT_PITCH, L"Microsoft YaHei UI");
+    g.titleFont = CreateFontW(S(-19), 0, 0, 0, FW_BOLD, FALSE, FALSE,
+                              FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                              CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                              DEFAULT_PITCH, L"Microsoft YaHei UI");
+    g.statusFont = CreateFontW(S(-17), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE,
+                               FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                               CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                               DEFAULT_PITCH, L"Microsoft YaHei UI");
+    g.smallFont = CreateFontW(S(-12), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
+                              FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                              CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                              DEFAULT_PITCH, L"Microsoft YaHei UI");
+}
+
+void DestroyFonts()
+{
+    if (g.font) { DeleteObject(g.font); g.font = nullptr; }
+    if (g.titleFont) { DeleteObject(g.titleFont); g.titleFont = nullptr; }
+    if (g.statusFont) { DeleteObject(g.statusFont); g.statusFont = nullptr; }
+    if (g.smallFont) { DeleteObject(g.smallFont); g.smallFont = nullptr; }
+}
+
+void ApplyFonts()
+{
+    for (HWND c = GetWindow(g.hwnd, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
+    HWND warn = GetDlgItem(g.hwnd, IDC_LBL_WARN);
+    if (warn)
+        SendMessageW(warn, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(g.smallFont), TRUE);
+}
+
+// PerMonitorV2 下跨显示器拖动时动态重算缩放、字号与布局
+void OnDpiChanged(HWND h, WPARAM w)
+{
+    const UINT dpi = HIWORD(w);
+    const double oldScale = g.scale;
+    double newScale = dpi ? static_cast<double>(dpi) / 96.0 : 1.0;
+    if (newScale <= 0)
+        newScale = 1.0;
+    const double ratio = newScale / oldScale;
+    g.scale = newScale;
+
+    SetWindowPos(h, nullptr, 0, 0, S(kW), S(kH),
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+    // 布局坐标是 scale 的线性函数，按比例缩放所有子控件即可
+    for (HWND c = GetWindow(h, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+        RECT rc{};
+        GetWindowRect(c, &rc);
+        POINT tl{ rc.left, rc.top };
+        ScreenToClient(h, &tl);
+        const int x = static_cast<int>(tl.x * ratio);
+        const int y = static_cast<int>(tl.y * ratio);
+        const int cw = static_cast<int>((rc.right - rc.left) * ratio);
+        const int ch = static_cast<int>((rc.bottom - rc.top) * ratio);
+        SetWindowPos(c, nullptr, x, y, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    // 列表列宽不会随控件缩放，需按新 DPI 重置
+    ListView_SetColumnWidth(GetDlgItem(h, IDC_LV_ADDR), 0, S(190));
+    ListView_SetColumnWidth(GetDlgItem(h, IDC_LV_ADDR), 1, S(100));
+    ListView_SetColumnWidth(GetDlgItem(h, IDC_LV_PATH), 0, S(300));
+    ListView_SetColumnWidth(GetDlgItem(h, IDC_LV_PATH), 1, S(100));
+
+    DestroyFonts();
+    CreateFonts();
+    ApplyFonts();
+    InvalidateRect(h, nullptr, TRUE);
+}
+
 // ---------- 界面构建 ----------
 
 void BuildUi()
@@ -1160,7 +1329,7 @@ void BuildUi()
     MakeCheckbox(h, IDC_CHK_NOSLEEP, L"修改后自动休眠", S(605), S(116), S(135),
                  S(34));
     HWND warn = MakeCaption(h, L"⚠ 可能被小蓝熊检测", S(750), S(121), S(130),
-                            S(22));
+                            S(22), IDC_LBL_WARN);
     SendMessageW(warn, WM_SETFONT, reinterpret_cast<WPARAM>(g.smallFont), TRUE);
 
     // 差分定位 + 指针
@@ -1201,27 +1370,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             g.scale = static_cast<double>(GetDpiForWindow(h)) / 96.0;
             if (g.scale <= 0)
                 g.scale = 1.0;
-            g.ww = S(kW);
-            g.wh = S(kH);
-            g.font = CreateFontW(S(-15), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
-                                 FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                 CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
-                                 DEFAULT_PITCH, L"Microsoft YaHei UI");
-            g.titleFont = CreateFontW(S(-19), 0, 0, 0, FW_BOLD, FALSE, FALSE,
-                                      FALSE, DEFAULT_CHARSET,
-                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                      DEFAULT_QUALITY, DEFAULT_PITCH,
-                                      L"Microsoft YaHei UI");
-            g.statusFont = CreateFontW(S(-17), 0, 0, 0, FW_SEMIBOLD, FALSE,
-                                       FALSE, FALSE, DEFAULT_CHARSET,
-                                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                       DEFAULT_QUALITY, DEFAULT_PITCH,
-                                       L"Microsoft YaHei UI");
-            g.smallFont = CreateFontW(S(-12), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
-                                      FALSE, DEFAULT_CHARSET,
-                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                      DEFAULT_QUALITY, DEFAULT_PITCH,
-                                      L"Microsoft YaHei UI");
+            CreateFonts();
             BuildUi();
             UpdateMonitorButton();
             AddTrayIcon();
@@ -1247,6 +1396,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             EndPaint(h, &ps);
             return 0;
         }
+        case WM_DPICHANGED:
+            OnDpiChanged(h, w);
+            return 0;
         case WM_ERASEBKGND:
             return 1;
         case WM_NCHITTEST: {
@@ -1263,8 +1415,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                 g.mouseTracked = true;
             }
             const int x = GET_X_LPARAM(l);
-            const bool overMin = x >= S(kW - 92) && x < S(kW - 52);
-            const bool overClose = x >= S(kW - 46) && x < S(kW - 6);
+            const int y = GET_Y_LPARAM(l);
+            const bool overMin = y < S(kTitleH) && x >= S(kW - 92) && x < S(kW - 52);
+            const bool overClose = y < S(kTitleH) && x >= S(kW - 46) && x < S(kW - 6);
             if (overMin != g.hovMin || overClose != g.hovClose) {
                 g.hovMin = overMin;
                 g.hovClose = overClose;
@@ -1316,11 +1469,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
         }
         case WM_CTLCOLORSTATIC: {
             HDC dc = reinterpret_cast<HDC>(w);
-            if (GetDlgCtrlID(reinterpret_cast<HWND>(l)) == IDC_LOG) {
-                SetTextColor(dc, kText);
-                SetBkColor(dc, kInput);
-                return reinterpret_cast<LRESULT>(g.inputBrush);
-            }
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, kTextDim);
             return reinterpret_cast<LRESULT>(g.bgBrush);
@@ -1344,11 +1492,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                 case IDC_BTN_FINDPTR:  DoFindPtr();     break;
                 case IDC_BTN_TEST:     DoTestPtr();     break;
                 case IDC_CHK_NOSLEEP:
-                    g.noSleepAfter = SendMessageW(
+                    g.autoSleep = SendMessageW(
                         GetDlgItem(g.hwnd, IDC_CHK_NOSLEEP), BM_GETCHECK, 0,
                         0) == BST_CHECKED;
                     SaveConfig();
-                    if (!g.noSleepAfter)
+                    if (!g.autoSleep)
                         Log(L"[配置] 修改后不休眠: 监控线程持续读写内存, "
                             L"长时间运行可能被小蓝熊(EAC)检测");
                     break;
@@ -1371,6 +1519,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
         }
         case WM_JOB: {
             auto* job = reinterpret_cast<ScanJob*>(l);
+            if (g.jobThread) {
+                CloseHandle(g.jobThread);
+                g.jobThread = nullptr;
+            }
             g.jobBusy = false;
             SetJobUi(true);
             if (!job->outErr.empty()) {
@@ -1390,7 +1542,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                     for (const ScanMatch& m : g.s1)
                         AddRow(lv, HexAddr(m.addr), std::to_wstring(m.value));
                     Log(L"步骤① 完成: 找到 %zu 处数值 = %lu", g.s1.size(),
-                        g.from);
+                        job->from);
+                    if (job->truncated)
+                        Log(L"[提示] 结果超过 %zu 条已截断——该数值太常见，"
+                            L"请换一个更独特的 from 值(如 500000000)。",
+                            kMaxScanResults);
                     Log(L"接下来: 去 VD Streamer 把码率滑块改为其他值(如600)，然后点按钮②");
                     break;
                 }
@@ -1403,7 +1559,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                         AddRow(lv, HexAddr(m.addr), std::to_wstring(m.value));
                     Log(L"步骤② 完成: 数值已改变的地址 %zu 处", g.s2.size());
                     Log(L"接下来: 去 VD Streamer 把码率滑块改回 %lu，然后点按钮③",
-                        g.from);
+                        job->from);
                     break;
                 }
                 case JOB_RESTORED: {
@@ -1414,10 +1570,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                     for (const ScanMatch& m : g.s3)
                         AddRow(lv, HexAddr(m.addr), std::to_wstring(m.value));
                     Log(L"步骤③ 完成: 改回后仍保持 %lu 的地址 %zu 处 (即跟随滑块的活地址)",
-                        g.from, g.s3.size());
+                        job->from, g.s3.size());
                     if (g.s3.empty())
                         Log(L"结果为空: 请确认滑块确实改回了 %lu 的精确值，并重试②③",
-                            g.from);
+                            job->from);
                     else
                         Log(L"可以继续执行 ④ 查找指针路径");
                     break;
@@ -1444,10 +1600,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                 case JOB_PATCHALL: {
                     g.scanner = std::move(job->scanner);
                     Log(L"[全量] 已修改 %d 处内存 (%lu -> %lu)", job->patched,
-                        g.from, g.to);
+                        job->from, job->to);
+                    if (job->truncated)
+                        Log(L"[全量] 结果超过 %zu 条已截断，未改完。",
+                            kMaxScanResults);
                     if (job->patched == 0)
                         Log(L"[全量] 未找到数值 %lu (请先确认 VD 码率滑块停在 %lu)",
-                            g.from, g.from);
+                            job->from, job->from);
                     break;
                 }
             }
@@ -1455,7 +1614,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             return 0;
         }
         case WM_SLEEP:
-            OnAutoSleep(h, reinterpret_cast<wchar_t*>(l));
+            OnAutoSleep(reinterpret_cast<wchar_t*>(l));
             return 0;
         case WM_SHOW:
             ShowWindow(h, SW_SHOW);
@@ -1497,6 +1656,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             }
             return 0;
         case WM_DESTROY: {
+            g.exiting = true;   // 通知后台任务自查自删
             NOTIFYICONDATAW nid{};
             nid.cbSize = sizeof(nid);
             nid.hWnd   = h;
@@ -1504,10 +1664,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             Shell_NotifyIconW(NIM_DELETE, &nid);
             StopMonitor();
             g.scanner.reset();
-            if (g.font) DeleteObject(g.font);
-            if (g.titleFont) DeleteObject(g.titleFont);
-            if (g.statusFont) DeleteObject(g.statusFont);
-            if (g.smallFont) DeleteObject(g.smallFont);
+            DestroyFonts();
             if (g.appIcon) DestroyIcon(g.appIcon);
             PostQuitMessage(0);
             return 0;
@@ -1532,11 +1689,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
 
     g.hInst = hInstance;
     g.bgBrush     = CreateSolidBrush(kBg);
-    g.cardBrush   = CreateSolidBrush(kCard);
     g.inputBrush  = CreateSolidBrush(kInput);
-    g.accentBrush = CreateSolidBrush(kAccent);
     g.appIcon     = CreateAppIcon(L"VD");
 
+    ResolveCfgDir();
     InitDarkMode();
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_LISTVIEW_CLASSES };
     InitCommonControlsEx(&icc);
@@ -1583,8 +1739,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
         DispatchMessageW(&msg);
     }
     DeleteObject(g.bgBrush);
-    DeleteObject(g.cardBrush);
     DeleteObject(g.inputBrush);
-    DeleteObject(g.accentBrush);
     return static_cast<int>(msg.wParam);
 }

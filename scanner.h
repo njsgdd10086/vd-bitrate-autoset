@@ -32,7 +32,9 @@ public:
     const std::wstring& ModuleName() const { return moduleName_; }
     uintptr_t ModuleBase() const { return moduleBase_; }
 
-    std::vector<ScanMatch> ScanValue(uint32_t value) const;
+    // 全内存精确扫描 value；maxResults>0 时达到上限即停止，truncated 标记是否被截断
+    std::vector<ScanMatch> ScanValue(uint32_t value, size_t maxResults = 0,
+                                     bool* truncated = nullptr) const;
     bool Read32(uintptr_t addr, uint32_t* out) const;
     bool Write32(uintptr_t addr, uint32_t v) const;
 

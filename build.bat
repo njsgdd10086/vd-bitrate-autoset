@@ -24,7 +24,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-cl /nologo /O2 /EHsc /utf-8 main.cpp scanner.cpp /Fe:vd-bitrate-autoset.exe /link user32.lib gdi32.lib comctl32.lib advapi32.lib psapi.lib /SUBSYSTEM:WINDOWS
+cl /nologo /O2 /MT /W4 /permissive- /EHsc /utf-8 main.cpp scanner.cpp /Fe:vd-bitrate-autoset.exe /link user32.lib gdi32.lib comctl32.lib advapi32.lib psapi.lib /SUBSYSTEM:WINDOWS
 if exist vd-bitrate-autoset.exe (
     echo.
     echo Build OK: vd-bitrate-autoset.exe
