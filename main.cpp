@@ -87,6 +87,7 @@ enum {
     IDC_BTN_RESTORED,
     IDC_BTN_FINDPTR,
     IDC_BTN_TEST,
+    IDC_BTN_CLEAN,
     IDC_LV_ADDR,
     IDC_LV_PATH,
     IDC_LOG,
@@ -137,10 +138,10 @@ struct AppState {
     MonState monState     = MonState::Standby;
     bool realExit         = false;
     bool jobBusy          = false;
-    bool autoSleep        = true;   // 修改后自动休眠(勾选; 关闭则继续监控, 有被EAC检测风险)
-    bool popupAfter       = true;   // 修改后自动弹出主窗口
+    std::atomic<bool> autoSleep{true};   // 修改后自动休眠(勾选; 关闭则继续监控, 有被EAC检测风险)
+    std::atomic<bool> popupAfter{true};  // 修改后自动弹出主窗口
     HFONT smallFont       = nullptr;
-    std::atomic<bool> exiting{false};  // 真正退出标志(后台任务据此自查自删)
+    std::atomic<bool> exiting{false};    // 真正退出标志(后台任务据此自查自删)
 };
 
 AppState g;
@@ -698,8 +699,8 @@ DWORD WINAPI JobProc(LPVOID lp);
 void SetJobUi(bool enabled)
 {
     for (int id : { IDC_BTN_SCAN, IDC_BTN_CHANGED, IDC_BTN_RESTORED,
-                    IDC_BTN_FINDPTR, IDC_BTN_TEST, IDC_BTN_PATCHALL,
-                    IDC_BTN_SAVE })
+                    IDC_BTN_FINDPTR, IDC_BTN_TEST, IDC_BTN_CLEAN,
+                    IDC_BTN_PATCHALL, IDC_BTN_SAVE })
         EnableWindow(GetDlgItem(g.hwnd, id), enabled);
 }
 
@@ -1030,8 +1031,6 @@ struct MonitorCtx {
     HWND hwnd;
     HANDLE stop;
     std::vector<PtrPath> paths;
-    bool sleep = true;
-    bool popup  = false;
 };
 
 DWORD WINAPI MonitorProc(LPVOID lp)
@@ -1061,9 +1060,9 @@ DWORD WINAPI MonitorProc(LPVOID lp)
                                L"SteamVR 启动，已修改 %d 处码率 %lu -> %lu",
                                done, ctx->from, ctx->to);
                     ThreadLog(ctx->hwnd, msg);
-                    if (ctx->popup)
+                    if (g.popupAfter.load())
                         PostMessageW(ctx->hwnd, WM_SHOW, 0, 0);
-                    if (ctx->sleep) {
+                    if (g.autoSleep.load()) {
                         // 修改完成 → 自动休眠
                         wchar_t* sleepMsg = _wcsdup(msg);
                         if (sleepMsg)
@@ -1073,9 +1072,11 @@ DWORD WINAPI MonitorProc(LPVOID lp)
                         ThreadLog(ctx->hwnd, L"[监控] 已开启「修改后不休眠」: "
                                     L"继续监听, 下次 SteamVR 启动会再次修改");
                     }
+                    // 仅在真正完成一次附加与修改尝试后置位；VD Streamer 尚未就绪
+                    // 或附加失败时保持 false，下个周期继续重试
+                    patched = true;
                 }
             }
-            patched = true;
         } else if (!vr) {
             patched = false;
         }
@@ -1112,8 +1113,7 @@ void ArmMonitor()
         return;
     }
 
-    auto* ctx = new MonitorCtx{ g.from, g.to, g.hwnd, nullptr, g.paths,
-                                g.autoSleep, g.popupAfter };
+    auto* ctx = new MonitorCtx{ g.from, g.to, g.hwnd, nullptr, g.paths };
     g.stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     ctx->stop = g.stopEvent;
     g.monitorThread = CreateThread(nullptr, 0, MonitorProc, ctx, 0, nullptr);
@@ -1163,6 +1163,63 @@ void OnAutoSleep(wchar_t* text)
 void DoPatchAll()
 {
     RunJob(JOB_PATCHALL);
+}
+
+// 清除失效指针：解析每条已保存路径并读取当前值，移除无法解析或值既非 from
+// 也非 to 的路径(值为 to 说明已修改成功、仍是有效路径，予以保留)。
+void DoCleanPaths()
+{
+    if (g.paths.empty()) {
+        MessageBoxW(g.hwnd, L"当前没有已保存的指针路径。", L"提示",
+                    MB_ICONINFORMATION);
+        return;
+    }
+    DWORD from = 0, to = 0;
+    if (!ParseBitrate(GetEditText(IDC_EDIT_FROM), &from) ||
+        !ParseBitrate(GetEditText(IDC_EDIT_TO), &to)) {
+        MessageBoxW(g.hwnd, L"from/to 必须是 1 ~ 4294967295 之间的十进制整数。",
+                    L"输入无效", MB_ICONWARNING);
+        return;
+    }
+    const DWORD pid = FindPidByName(kVdStreamer);
+    if (pid == 0) {
+        MessageBoxW(g.hwnd,
+                    L"未找到 virtualdesktop.streamer.exe，请先启动 Virtual Desktop Streamer。",
+                    L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    VdScanner sc(pid);
+    if (!sc.Attach()) {
+        MessageBoxW(g.hwnd, L"无法打开进程句柄（可能权限不足）。", L"错误",
+                    MB_ICONERROR);
+        return;
+    }
+
+    std::vector<PtrPath> keep;
+    int removed = 0, failed = 0;
+    for (const PtrPath& p : g.paths) {
+        uintptr_t addr = 0;
+        uint32_t v = 0;
+        if (!sc.Resolve(p, &addr)) {
+            ++failed;
+            ++removed;
+            continue;
+        }
+        if (sc.Read32(addr, &v) && (v == from || v == to)) {
+            keep.push_back(p);
+        } else {
+            ++removed;
+        }
+    }
+
+    g.paths = std::move(keep);
+    HWND lv = GetDlgItem(g.hwnd, IDC_LV_PATH);
+    ListView_DeleteAllItems(lv);
+    for (const PtrPath& p : g.paths)
+        AddRow(lv, p.ToString(), L"");
+    SaveConfig();
+    Log(L"[清理] 移除 %d 条失效指针(其中 %d 条无法解析)，保留 %zu 条，已保存配置",
+        removed, failed, g.paths.size());
 }
 
 // ---------- 窗口绘制 ----------
@@ -1338,6 +1395,7 @@ void BuildUi()
     MakeButton(h, IDC_BTN_RESTORED, L"③ 已改回", S(270), S(162), S(120), S(32));
     MakeButton(h, IDC_BTN_FINDPTR, L"④ 查找指针", S(398), S(162), S(120), S(32));
     MakeButton(h, IDC_BTN_TEST, L"⑤ 测试路径", S(526), S(162), S(120), S(32));
+    MakeButton(h, IDC_BTN_CLEAN, L"⑥ 清除失效指针", S(654), S(162), S(150), S(32));
 
     // 列表
     MakeCaption(h, L"①-③ 差分定位结果", S(14), S(202), S(200), S(18));
@@ -1491,6 +1549,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                 case IDC_BTN_RESTORED: DoRestored();    break;
                 case IDC_BTN_FINDPTR:  DoFindPtr();     break;
                 case IDC_BTN_TEST:     DoTestPtr();     break;
+                case IDC_BTN_CLEAN:    DoCleanPaths();  break;
                 case IDC_CHK_NOSLEEP:
                     g.autoSleep = SendMessageW(
                         GetDlgItem(g.hwnd, IDC_CHK_NOSLEEP), BM_GETCHECK, 0,
@@ -1617,7 +1676,14 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             OnAutoSleep(reinterpret_cast<wchar_t*>(l));
             return 0;
         case WM_SHOW:
+            if (IsIconic(h))
+                ShowWindow(h, SW_RESTORE);
             ShowWindow(h, SW_SHOW);
+            // 进程不在前台时 SetForegroundWindow 常被忽略，短暂置顶兜底再恢复
+            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
             SetForegroundWindow(h);
             return 0;
         case WM_TRAY:
@@ -1677,6 +1743,25 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
 {
+    // 单实例互斥：重复启动时唤起已有窗口并退出
+    HANDLE hMutex = CreateMutexW(nullptr, FALSE, L"VdBitrateAutoset_SingleInstance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND prev = FindWindowW(L"VdBitrateAutosetWnd", nullptr);
+        if (prev) {
+            if (IsIconic(prev))
+                ShowWindow(prev, SW_RESTORE);
+            ShowWindow(prev, SW_SHOW);
+            SetWindowPos(prev, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            SetWindowPos(prev, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            SetForegroundWindow(prev);
+        }
+        if (hMutex)
+            CloseHandle(hMutex);
+        return 0;
+    }
+
     // PerMonitorV2 DPI 感知，保证自绘 UI 在任意缩放比下像素级正确
     {
         using Fn = BOOL(WINAPI*)(void*);
@@ -1711,8 +1796,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
                                 WS_POPUP | WS_MINIMIZEBOX, CW_USEDEFAULT,
                                 CW_USEDEFAULT, kW, kH, nullptr, nullptr,
                                 hInstance, nullptr);
-    if (!hwnd)
+    if (!hwnd) {
+        if (hMutex)
+            CloseHandle(hMutex);
         return 1;
+    }
 
     // 按窗口所在监视器 DPI 缩放窗口与布局
     {
@@ -1740,5 +1828,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
     }
     DeleteObject(g.bgBrush);
     DeleteObject(g.inputBrush);
+    if (hMutex)
+        CloseHandle(hMutex);
     return static_cast<int>(msg.wParam);
 }
