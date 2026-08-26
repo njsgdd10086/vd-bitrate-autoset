@@ -48,7 +48,7 @@
 
 namespace {
 
-constexpr DWORD kDefaultFrom = 500000000;
+constexpr DWORD kDefaultFrom = 10000000;
 constexpr DWORD kDefaultTo   = 800000000;
 
 // ---------- 主题色 ----------
@@ -1370,7 +1370,7 @@ void BuildUi()
 
     // 状态胶囊右侧的数值输入
     MakeCaption(h, L"from(bit)", S(412), S(69), S(76), S(20));
-    MakeEdit(h, IDC_EDIT_FROM, S(492), S(65), S(120), S(26), L"500000000");
+    MakeEdit(h, IDC_EDIT_FROM, S(492), S(65), S(120), S(26), L"10000000");
     MakeCaption(h, L"to(bit)", S(624), S(69), S(56), S(20));
     MakeEdit(h, IDC_EDIT_TO, S(680), S(65), S(120), S(26), L"800000000");
 
@@ -1604,7 +1604,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                         job->from);
                     if (job->truncated)
                         Log(L"[提示] 结果超过 %zu 条已截断——该数值太常见，"
-                            L"请换一个更独特的 from 值(如 500000000)。",
+                            L"请换一个更独特的 from 值(如 123456789)。",
                             kMaxScanResults);
                     Log(L"接下来: 去 VD Streamer 把码率滑块改为其他值(如600)，然后点按钮②");
                     break;
