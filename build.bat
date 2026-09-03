@@ -25,8 +25,14 @@ if errorlevel 1 (
 )
 
 cl /nologo /O2 /MT /W4 /permissive- /EHsc /utf-8 main.cpp scanner.cpp /Fe:vd-bitrate-autoset.exe /link user32.lib gdi32.lib comctl32.lib advapi32.lib psapi.lib /SUBSYSTEM:WINDOWS
-if exist vd-bitrate-autoset.exe (
-    echo.
-    echo Build OK: vd-bitrate-autoset.exe
+if errorlevel 1 (
+    echo [ERROR] Release build failed.
+    exit /b 1
 )
+if not exist vd-bitrate-autoset.exe (
+    echo [ERROR] Release executable was not produced.
+    exit /b 1
+)
+echo.
+echo Build OK: vd-bitrate-autoset.exe
 endlocal
