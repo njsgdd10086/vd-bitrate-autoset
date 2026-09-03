@@ -34,7 +34,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
+#include <map>
 #include <memory>
+#include <new>
+#include <process.h>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -98,6 +103,9 @@ enum {
 
 // 单次扫描/全量修改的结果上限，防止数值过于常见时 UI 卡死
 constexpr size_t kMaxScanResults = 1000000;
+// ListView 逐条插入大量项目会阻塞 UI；完整结果仍保留在内存中供后续差分。
+constexpr size_t kMaxDisplayedResults = 20000;
+constexpr size_t kPointerMaxNodes = 128;
 
 constexpr UINT WM_TRAY   = WM_APP + 10;
 constexpr UINT WM_LOGMSG = WM_APP + 1;
@@ -106,6 +114,7 @@ constexpr UINT WM_SLEEP  = WM_APP + 3;
 constexpr UINT WM_JOB    = WM_APP + 4;
 constexpr UINT WM_SHOW   = WM_APP + 5;
 constexpr UINT kTrayId   = 1;
+UINT g_taskbarCreated = 0;
 
 // ---------- 状态机 ----------
 enum class MonState { Standby, Armed, Sleeping };
@@ -129,6 +138,7 @@ struct AppState {
     std::unique_ptr<VdScanner> scanner;
     std::vector<ScanMatch> s1, s2, s3;
     std::vector<PtrPath> paths;
+    std::vector<int> pathScores;
     DWORD from = kDefaultFrom;
     DWORD to   = kDefaultTo;
 
@@ -138,6 +148,7 @@ struct AppState {
     MonState monState     = MonState::Standby;
     bool realExit         = false;
     bool jobBusy          = false;
+    std::atomic<unsigned long long> monitorGeneration{0};
     std::atomic<bool> autoSleep{true};   // 修改后自动休眠(勾选; 关闭则继续监控, 有被EAC检测风险)
     std::atomic<bool> popupAfter{true};  // 修改后自动弹出主窗口
     HFONT smallFont       = nullptr;
@@ -218,9 +229,12 @@ void Log(const wchar_t* fmt, ...)
 
 void ThreadLog(HWND hwnd, const wchar_t* text)
 {
+    if (!hwnd || g.exiting.load())
+        return;
     wchar_t* copy = _wcsdup(text);
-    if (copy)
-        PostMessageW(hwnd, WM_LOGMSG, 0, reinterpret_cast<LPARAM>(copy));
+    if (copy && !PostMessageW(hwnd, WM_LOGMSG, 0,
+                              reinterpret_cast<LPARAM>(copy)))
+        free(copy);
 }
 
 void InvalidatePill()
@@ -300,7 +314,7 @@ HICON CreateAppIcon(const wchar_t* text)
     return icon;
 }
 
-void AddTrayIcon()
+bool AddTrayIcon()
 {
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
@@ -310,9 +324,11 @@ void AddTrayIcon()
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = g.appIcon;
     wcsncpy_s(nid.szTip, L"VD码率修改器 - 双击显示窗口", _TRUNCATE);
-    Shell_NotifyIconW(NIM_ADD, &nid);
+    if (!Shell_NotifyIconW(NIM_ADD, &nid))
+        return false;
     nid.uVersion = NOTIFYICON_VERSION_4;  // 启用 Win10 现代托盘行为/气泡
     Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    return true;
 }
 
 void TrayBalloon(const wchar_t* info)
@@ -521,9 +537,13 @@ std::wstring GetEditText(int id)
 {
     HWND e = GetDlgItem(g.hwnd, id);
     const int len = GetWindowTextLengthW(e);
-    std::wstring s(len, L'\0');
-    if (len > 0)
-        GetWindowTextW(e, &s[0], len + 1);
+    std::wstring s(static_cast<size_t>(len) + 1, L'\0');
+    if (len > 0) {
+        const int copied = GetWindowTextW(e, &s[0], len + 1);
+        s.resize(static_cast<size_t>(copied));
+    } else {
+        s.clear();
+    }
     return s;
 }
 
@@ -625,6 +645,20 @@ std::wstring HexAddr(uintptr_t a)
     return buf;
 }
 
+void FillAddressList(HWND lv, const std::vector<ScanMatch>& matches)
+{
+    ListView_DeleteAllItems(lv);
+    const size_t shown = (std::min)(matches.size(), kMaxDisplayedResults);
+    for (size_t i = 0; i < shown; ++i) {
+        const ScanMatch& m = matches[i];
+        AddRow(lv, HexAddr(m.addr), std::to_wstring(m.value));
+    }
+    if (shown < matches.size()) {
+        AddRow(lv, L"…（其余结果已保留，未在列表显示）",
+               std::to_wstring(matches.size() - shown));
+    }
+}
+
 // ---------- 监控状态按钮 ----------
 
 void UpdateMonitorButton()
@@ -688,13 +722,113 @@ struct ScanJob {
     std::vector<ScanMatch> inMatches;
     std::vector<ScanMatch> outMatches;
     std::vector<PtrPath> outPaths;
+    std::vector<int> outPathScores;
     std::wstring outErr;
     int patched = 0;
     bool truncated = false;   // ScanValue 结果被上限截断
     std::unique_ptr<VdScanner> scanner;
 };
 
-DWORD WINAPI JobProc(LPVOID lp);
+struct LeafPath {
+    PtrPath path;
+    uintptr_t leaf = 0;
+    size_t leafIndex = 0;
+};
+
+std::wstring PathPrefixKey(const PtrPath& path)
+{
+    const std::wstring full = path.ToString();
+    if (path.hops.empty())
+        return full;
+    const size_t colon = full.rfind(L':');
+    return colon == std::wstring::npos ? full : full.substr(0, colon);
+}
+
+long long SignedDelta(uintptr_t a, uintptr_t b)
+{
+    if (b >= a)
+        return static_cast<long long>(b - a);
+    return -static_cast<long long>(a - b);
+}
+
+void RankLeafPaths(const VdScanner& scanner,
+                   const std::vector<LeafPath>& candidates,
+                   std::vector<PtrPath>& outPaths,
+                   std::vector<int>& outScores)
+{
+    std::vector<LeafPath> valid;
+    std::set<std::wstring> seen;
+    std::map<std::wstring, std::vector<size_t>> groups;
+    for (const LeafPath& candidate : candidates) {
+        uintptr_t resolved = 0;
+        if (!scanner.Resolve(candidate.path, &resolved) || resolved != candidate.leaf)
+            continue;
+        const std::wstring full = candidate.path.ToString();
+        const std::wstring uniqueKey = full + L"#" + std::to_wstring(candidate.leafIndex);
+        if (!seen.insert(uniqueKey).second)
+            continue;
+        const size_t index = valid.size();
+        valid.push_back(candidate);
+        groups[PathPrefixKey(candidate.path)].push_back(index);
+    }
+
+    struct Ranked {
+        PtrPath path;
+        int score = 0;
+    };
+    std::vector<Ranked> ranked;
+    for (const auto& group : groups) {
+        std::set<size_t> leaves;
+        for (size_t index : group.second)
+            leaves.insert(valid[index].leafIndex);
+        const int leafCount = static_cast<int>(leaves.size());
+        for (size_t index : group.second) {
+            const LeafPath& current = valid[index];
+            int score = leafCount * 100;
+            if (leafCount >= 3)
+                score += 100;
+            if (!current.path.hops.empty()) {
+                const uintptr_t currentHop = current.path.hops.back();
+                for (size_t otherIndex : group.second) {
+                    const LeafPath& other = valid[otherIndex];
+                    if (other.leafIndex == current.leafIndex ||
+                        other.path.hops.empty())
+                        continue;
+                    const long long leafDelta = SignedDelta(current.leaf, other.leaf);
+                    const long long hopDelta = SignedDelta(currentHop,
+                                                           other.path.hops.back());
+                    if (hopDelta == leafDelta)
+                        score += 50;
+                    const long long smallDelta =
+                        hopDelta < 0 ? -hopDelta : hopDelta;
+                    if (smallDelta == 0 || smallDelta == 4 || smallDelta == 8)
+                        score += 10;
+                }
+            }
+            ranked.push_back({ current.path, score });
+        }
+    }
+
+    std::sort(ranked.begin(), ranked.end(), [](const Ranked& a, const Ranked& b) {
+        if (a.score != b.score)
+            return a.score > b.score;
+        return a.path.ToString() < b.path.ToString();
+    });
+    std::set<std::wstring> outputSeen;
+    for (const Ranked& item : ranked) {
+        if (outputSeen.insert(item.path.ToString()).second) {
+            outPaths.push_back(item.path);
+            outScores.push_back(item.score);
+        }
+    }
+}
+
+unsigned __stdcall JobProc(void* lp);
+
+bool IsJobCancelled(void*)
+{
+    return g.exiting.load();
+}
 
 void SetJobUi(bool enabled)
 {
@@ -727,7 +861,7 @@ void RunJob(int kind, std::vector<ScanMatch> in = {})
     if (g.scanner)
         job->scanner = std::move(g.scanner);
 
-    HANDLE t = CreateThread(nullptr, 0, JobProc, job, 0, nullptr);
+    const uintptr_t t = _beginthreadex(nullptr, 0, JobProc, job, 0, nullptr);
     if (!t) {
         g.jobBusy = false;
         SetJobUi(true);
@@ -736,19 +870,19 @@ void RunJob(int kind, std::vector<ScanMatch> in = {})
         delete job;
         return;
     }
-    g.jobThread = t;
+    g.jobThread = reinterpret_cast<HANDLE>(t);
 }
 
 void PtrScanProgressCb(void* ctx, int depth, size_t candidates, DWORD elapsedMs)
 {
     wchar_t buf[256];
     swprintf_s(buf, _countof(buf),
-               L"  第 %d 层: %zu 个候选指针, 已用时 %lu 秒...",
+               L"  第 %d 层: 当前待扩展 %zu 个节点, 已用时 %lu 秒...",
                depth, candidates, elapsedMs / 1000);
     ThreadLog(reinterpret_cast<HWND>(ctx), buf);
 }
 
-DWORD WINAPI JobProc(LPVOID lp)
+unsigned __stdcall JobProc(void* lp)
 {
     auto* job = static_cast<ScanJob*>(lp);
     switch (job->kind) {
@@ -767,11 +901,14 @@ DWORD WINAPI JobProc(LPVOID lp)
             job->scanner = std::move(sc);
             ThreadLog(g.hwnd, L"已附加 virtualdesktop.streamer.exe，正在全内存扫描...");
             job->outMatches =
-                job->scanner->ScanValue(job->from, kMaxScanResults, &job->truncated);
+                job->scanner->ScanValue(job->from, kMaxScanResults, &job->truncated,
+                                        IsJobCancelled, nullptr);
             break;
         }
         case JOB_CHANGED:
             for (const ScanMatch& m : job->inMatches) {
+                if (g.exiting.load())
+                    break;
                 uint32_t v = 0;
                 if (job->scanner->Read32(m.addr, &v) && v != job->from)
                     job->outMatches.push_back({ m.addr, v });
@@ -779,6 +916,8 @@ DWORD WINAPI JobProc(LPVOID lp)
             break;
         case JOB_RESTORED:
             for (const ScanMatch& m : job->inMatches) {
+                if (g.exiting.load())
+                    break;
                 uint32_t v = 0;
                 if (job->scanner->Read32(m.addr, &v) && v == job->from)
                     job->outMatches.push_back({ m.addr, v });
@@ -786,37 +925,110 @@ DWORD WINAPI JobProc(LPVOID lp)
             break;
         case JOB_FINDPTR: {
             const size_t maxLeaves = (std::min)(job->inMatches.size(), size_t(8));
+            if (job->inMatches.size() > maxLeaves)
+                ThreadLog(g.hwnd, L"[指针] 差分结果超过 8 个叶地址，仅扫描前 8 个；"
+                                    L"可先清理候选后重试");
+            std::vector<LeafPath> leafCandidates;
+            bool primaryComplete = true;
+            wchar_t buf[256];
             for (size_t i = 0; i < maxLeaves; ++i) {
-                wchar_t buf[256];
+                if (g.exiting.load())
+                    break;
                 swprintf_s(buf, _countof(buf),
                            L"  叶地址 %s: 反向扫描指针链(最多4层,每叶限时180秒)...",
                            HexAddr(job->inMatches[i].addr).c_str());
                 ThreadLog(g.hwnd, buf);
                 const DWORD t0 = GetTickCount();
-                const std::vector<PtrPath> found =
+                PtrScanStats stats{};
+                std::vector<PtrPath> found =
                     job->scanner->FindPointerPaths(job->inMatches[i].addr, 4,
-                                                   8, 180000,
-                                                   PtrScanProgressCb,
-                                                   g.hwnd);
+                                                    kPointerMaxNodes, 180000,
+                                                    PtrScanProgressCb,
+                                                    g.hwnd,
+                                                    IsJobCancelled,
+                                                    nullptr,
+                                                    &stats,
+                                                    false);
                 const DWORD secs = (GetTickCount() - t0) / 1000;
+                const wchar_t* scanState =
+                    stats.cancelled ? L"（已取消）" :
+                    (stats.timedOut ? L"（超时）" : L"");
                 swprintf_s(buf, _countof(buf),
-                           L"  叶地址 %s: 用时 %lu 秒, 找到 %zu 条候选路径",
-                           HexAddr(job->inMatches[i].addr).c_str(), secs,
-                           found.size());
+                           L"  叶地址 %s: 用时 %lu 秒, 找到 %zu 条候选路径，"
+                           L"命中 %zu，目标模块根 %zu，其他模块根 %zu，"
+                           L"只读模块 %zu，其他模块命中 %zu，普通内存 %zu，"
+                           L"保留 %zu，丢弃 %zu%s%s",
+                            HexAddr(job->inMatches[i].addr).c_str(), secs,
+                             found.size(), stats.matches, stats.moduleRoots,
+                             stats.otherModuleRoots, stats.readOnlyModuleMatches,
+                             stats.otherModuleMatches, stats.nonModuleMatches,
+                             stats.kept, stats.dropped,
+                           stats.truncated ? L"（已截断）" : L"",
+                           scanState);
                 ThreadLog(g.hwnd, buf);
                 for (const PtrPath& p : found)
-                    job->outPaths.push_back(p);
+                    leafCandidates.push_back({p, job->inMatches[i].addr, i});
+                if (stats.cancelled || stats.timedOut)
+                    primaryComplete = false;
             }
-            std::sort(job->outPaths.begin(), job->outPaths.end(),
-                      [](const PtrPath& a, const PtrPath& b) {
-                          return a.ToString() < b.ToString();
-                      });
-            job->outPaths.erase(
-                std::unique(job->outPaths.begin(), job->outPaths.end(),
-                            [](const PtrPath& a, const PtrPath& b) {
-                                return a.ToString() == b.ToString();
-                            }),
-                job->outPaths.end());
+
+            std::vector<PtrPath> ranked;
+            std::vector<int> scores;
+            RankLeafPaths(*job->scanner, leafCandidates, ranked, scores);
+            size_t jointCount = 0;
+            const int jointThreshold = maxLeaves >= 3 ? 400 : 200;
+            for (int score : scores)
+                if (score >= jointThreshold)
+                    ++jointCount;
+
+            if (jointCount == 0 && primaryComplete && !g.exiting.load()) {
+                ThreadLog(g.hwnd, L"[指针] 对齐扫描未发现可跨编码联合验证的路径，"
+                                    L"开始兼容非 8 字节对齐指针的回退扫描...");
+                for (size_t i = 0; i < maxLeaves; ++i) {
+                    if (g.exiting.load())
+                        break;
+                    PtrScanStats looseStats{};
+                    const DWORD looseT0 = GetTickCount();
+                    const std::vector<PtrPath> loose =
+                        job->scanner->FindPointerPaths(
+                            job->inMatches[i].addr, 4, kPointerMaxNodes, 180000,
+                            PtrScanProgressCb, g.hwnd, IsJobCancelled, nullptr,
+                            &looseStats, true);
+                    for (const PtrPath& p : loose)
+                        leafCandidates.push_back({p, job->inMatches[i].addr, i});
+                    const DWORD looseSecs = (GetTickCount() - looseT0) / 1000;
+                    swprintf_s(buf, _countof(buf),
+                                L"  叶地址 %s: 非对齐回退用时 %lu 秒，找到 %zu 条路径，"
+                                L"命中 %zu，目标模块根 %zu，其他模块根 %zu，"
+                                L"只读模块 %zu，其他模块命中 %zu，普通内存 %zu，"
+                                L"保留 %zu，丢弃 %zu%s%s",
+                               HexAddr(job->inMatches[i].addr).c_str(), looseSecs,
+                               loose.size(), looseStats.matches,
+                                looseStats.moduleRoots,
+                                looseStats.otherModuleRoots,
+                                looseStats.readOnlyModuleMatches,
+                                looseStats.otherModuleMatches,
+                                looseStats.nonModuleMatches, looseStats.kept,
+                               looseStats.dropped,
+                               looseStats.truncated ? L"（已截断）" : L"",
+                               looseStats.timedOut ? L"（超时）" : L"");
+                    ThreadLog(g.hwnd, buf);
+                }
+                ranked.clear();
+                scores.clear();
+                RankLeafPaths(*job->scanner, leafCandidates, ranked, scores);
+                jointCount = 0;
+                for (int score : scores)
+                    if (score >= jointThreshold)
+                        ++jointCount;
+            }
+
+            job->outPaths = std::move(ranked);
+            job->outPathScores = std::move(scores);
+            swprintf_s(buf, _countof(buf),
+                       L"[指针] 联合验证完成：%zu 条去重路径，其中 %zu 条可由全部目标叶地址共用前缀",
+                       job->outPaths.size(), jointCount);
+            ThreadLog(g.hwnd, buf);
             break;
         }
         case JOB_PATCHALL: {
@@ -835,9 +1047,13 @@ DWORD WINAPI JobProc(LPVOID lp)
             }
             for (const ScanMatch& m :
                  job->scanner->ScanValue(job->from, kMaxScanResults,
-                                         &job->truncated))
+                                         &job->truncated,
+                                         IsJobCancelled, nullptr)) {
+                if (g.exiting.load())
+                    break;
                 if (job->scanner->Write32(m.addr, job->to))
                     ++job->patched;
+            }
             break;
         }
     }
@@ -918,12 +1134,13 @@ void DoTestPtr()
         return;
     }
     uint32_t v = 0;
-    g.scanner->Read32(addr, &v);
+    const bool readOk = g.scanner->Read32(addr, &v);
     wchar_t msg[512];
     swprintf_s(msg, _countof(msg),
-               L"路径: %s\n解析地址: %s\n当前数值: %lu\n\n"
+               L"路径: %s\n解析地址: %s\n当前数值: %s\n\n"
                L"如果当前数值 = VD 界面显示的码率，则该路径正确。",
-               p.ToString().c_str(), HexAddr(addr).c_str(), v);
+               p.ToString().c_str(), HexAddr(addr).c_str(),
+               readOk ? std::to_wstring(v).c_str() : L"读取失败");
     MessageBoxW(g.hwnd, msg, L"路径测试", MB_OK | MB_ICONINFORMATION);
 }
 
@@ -948,10 +1165,15 @@ void ResolveCfgDir()
 
     // 探测 exe 目录可写性
     HANDLE probe = CreateFileW(exeCfg.c_str(), GENERIC_WRITE, 0, nullptr,
-                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                               CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (probe != INVALID_HANDLE_VALUE) {
         CloseHandle(probe);
         DeleteFileW(exeCfg.c_str());
+        g_cfgDir = exeDir;
+        return;
+    }
+    if (GetLastError() == ERROR_FILE_EXISTS) {
+        // 其他实例可能刚刚创建了配置，沿用 exe 目录但绝不覆盖它。
         g_cfgDir = exeDir;
         return;
     }
@@ -972,12 +1194,39 @@ std::wstring CfgPath()
     return g_cfgDir + L"\\" + kCfgFile;
 }
 
-void SaveConfig()
+bool ParseConfigDword(const std::wstring& text, DWORD* out)
 {
-    std::wofstream f(CfgPath(), std::ios::out | std::ios::trunc);
+    if (!out || text.empty())
+        return false;
+    for (wchar_t c : text)
+        if (c < L'0' || c > L'9')
+            return false;
+    wchar_t* end = nullptr;
+    const unsigned long long v = wcstoull(text.c_str(), &end, 10);
+    if (!end || *end != L'\0' || v == 0 ||
+        v > (std::numeric_limits<DWORD>::max)())
+        return false;
+    *out = static_cast<DWORD>(v);
+    return true;
+}
+
+bool SaveConfig()
+{
+    DWORD from = 0, to = 0;
+    if (!ParseBitrate(GetEditText(IDC_EDIT_FROM), &from) ||
+        !ParseBitrate(GetEditText(IDC_EDIT_TO), &to)) {
+        Log(L"[配置] 保存失败：from/to 必须是 1 ~ 4294967295 之间的十进制整数");
+        return false;
+    }
+    g.from = from;
+    g.to = to;
+
+    const std::wstring path = CfgPath();
+    const std::wstring temp = path + L".tmp";
+    std::wofstream f(temp, std::ios::out | std::ios::trunc);
     if (!f.is_open()) {
-        Log(L"[配置] 保存失败：无法写入 %s", CfgPath().c_str());
-        return;
+        Log(L"[配置] 保存失败：无法写入 %s", path.c_str());
+        return false;
     }
     f << L"from=" << g.from << L"\n";
     f << L"to=" << g.to << L"\n";
@@ -986,30 +1235,65 @@ void SaveConfig()
     for (const PtrPath& p : g.paths)
         f << L"path=" << p.ToString() << L"\n";
     f.flush();
-    if (!f.good())
-        Log(L"[配置] 保存失败：写入出错 %s", CfgPath().c_str());
+    if (!f.good()) {
+        f.close();
+        DeleteFileW(temp.c_str());
+        Log(L"[配置] 保存失败：写入出错 %s", path.c_str());
+        return false;
+    }
+    f.close();
+    if (!MoveFileExW(temp.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temp.c_str());
+        Log(L"[配置] 保存失败：无法替换配置文件 %s", path.c_str());
+        return false;
+    }
+    return true;
 }
 
 void LoadConfig()
 {
+    g.paths.clear();
+    g.pathScores.clear();
     std::wifstream f(CfgPath());
+    int invalid = 0;
     if (f) {
         std::wstring line;
         while (std::getline(f, line)) {
-        if (line.rfind(L"from=", 0) == 0)
-            g.from = static_cast<DWORD>(wcstoull(line.c_str() + 5, nullptr, 10));
-        else if (line.rfind(L"to=", 0) == 0)
-            g.to = static_cast<DWORD>(wcstoull(line.c_str() + 3, nullptr, 10));
-        else if (line.rfind(L"nosleep=", 0) == 0)
-            g.autoSleep = _wtoi(line.c_str() + 8) == 0;
-        else if (line.rfind(L"popup_after=", 0) == 0)
-            g.popupAfter = _wtoi(line.c_str() + 12) != 0;
-        else if (line.rfind(L"path=", 0) == 0) {
-            PtrPath p;
-            if (PtrPath::Parse(line.substr(5), p))
-                g.paths.push_back(p);
+            if (!line.empty() && line.back() == L'\r')
+                line.pop_back();
+            if (line.rfind(L"from=", 0) == 0) {
+                DWORD value = 0;
+                if (ParseConfigDword(line.substr(5), &value))
+                    g.from = value;
+                else
+                    ++invalid;
+            } else if (line.rfind(L"to=", 0) == 0) {
+                DWORD value = 0;
+                if (ParseConfigDword(line.substr(3), &value))
+                    g.to = value;
+                else
+                    ++invalid;
+            } else if (line.rfind(L"nosleep=", 0) == 0) {
+                const std::wstring value = line.substr(8);
+                if (value == L"0" || value == L"1")
+                    g.autoSleep = value == L"0";
+                else
+                    ++invalid;
+            } else if (line.rfind(L"popup_after=", 0) == 0) {
+                const std::wstring value = line.substr(12);
+                if (value == L"0" || value == L"1")
+                    g.popupAfter = value != L"0";
+                else
+                    ++invalid;
+            } else if (line.rfind(L"path=", 0) == 0) {
+                PtrPath p;
+                if (PtrPath::Parse(line.substr(5), p))
+                    g.paths.push_back(p);
+                else
+                    ++invalid;
+            }
         }
-    }
     }
     SetEditText(IDC_EDIT_FROM, std::to_wstring(g.from));
     SetEditText(IDC_EDIT_TO, std::to_wstring(g.to));
@@ -1022,6 +1306,9 @@ void LoadConfig()
     HWND lv = GetDlgItem(g.hwnd, IDC_LV_PATH);
     for (const PtrPath& p : g.paths)
         AddRow(lv, p.ToString(), L"");
+    g.pathScores.assign(g.paths.size(), 0);
+    if (invalid)
+        Log(L"[配置] 忽略 %d 条格式无效的配置项", invalid);
 }
 
 // ---------- 自动监视 ----------
@@ -1030,10 +1317,16 @@ struct MonitorCtx {
     DWORD from, to;
     HWND hwnd;
     HANDLE stop;
+    unsigned long long generation;
     std::vector<PtrPath> paths;
 };
 
-DWORD WINAPI MonitorProc(LPVOID lp)
+struct SleepNotice {
+    unsigned long long generation;
+    wchar_t* text;
+};
+
+unsigned __stdcall MonitorProc(void* lp)
 {
     auto* ctx = static_cast<MonitorCtx*>(lp);
     bool patched = false;
@@ -1045,29 +1338,49 @@ DWORD WINAPI MonitorProc(LPVOID lp)
                 VdScanner sc(pid);
                 if (sc.Attach()) {
                     int done = 0;
+                    int resolved = 0;
+                    int toMatches = 0;
                     for (const PtrPath& p : ctx->paths) {
                         uintptr_t addr = 0;
                         if (!sc.Resolve(p, &addr))
                             continue;
+                        ++resolved;
                         uint32_t v = 0;
-                        if (sc.Read32(addr, &v) && v == ctx->from) {
-                            if (sc.Write32(addr, ctx->to))
-                                ++done;
+                        if (sc.Read32(addr, &v)) {
+                            if (v == ctx->from) {
+                                if (sc.Write32(addr, ctx->to))
+                                    ++done;
+                            } else if (v == ctx->to) {
+                                ++toMatches;
+                            }
                         }
                     }
+                    const bool complete = done > 0 ||
+                                          (resolved > 0 && toMatches == resolved);
+                    if (!complete)
+                        continue;
                     wchar_t msg[256];
                     swprintf_s(msg, _countof(msg),
                                L"SteamVR 启动，已修改 %d 处码率 %lu -> %lu",
                                done, ctx->from, ctx->to);
                     ThreadLog(ctx->hwnd, msg);
-                    if (g.popupAfter.load())
-                        PostMessageW(ctx->hwnd, WM_SHOW, 0, 0);
-                    if (g.autoSleep.load()) {
+                    if (!g.exiting.load() && g.popupAfter.load())
+                        PostMessageW(ctx->hwnd, WM_SHOW,
+                                     static_cast<WPARAM>(ctx->generation), 0);
+                    if (!g.exiting.load() && g.autoSleep.load()) {
                         // 修改完成 → 自动休眠
                         wchar_t* sleepMsg = _wcsdup(msg);
-                        if (sleepMsg)
-                            PostMessageW(ctx->hwnd, WM_SLEEP, 0,
-                                         reinterpret_cast<LPARAM>(sleepMsg));
+                        if (sleepMsg) {
+                            auto* notice = new (std::nothrow)
+                                SleepNotice{ctx->generation, sleepMsg};
+                            if (!notice || !PostMessageW(
+                                    ctx->hwnd, WM_SLEEP, 0,
+                                    reinterpret_cast<LPARAM>(notice))) {
+                                if (notice)
+                                    delete notice;
+                                free(sleepMsg);
+                            }
+                        }
                     } else {
                         ThreadLog(ctx->hwnd, L"[监控] 已开启「修改后不休眠」: "
                                     L"继续监听, 下次 SteamVR 启动会再次修改");
@@ -1081,7 +1394,6 @@ DWORD WINAPI MonitorProc(LPVOID lp)
             patched = false;
         }
     }
-    CloseHandle(ctx->stop);
     delete ctx;
     return 0;
 }
@@ -1090,10 +1402,18 @@ void StopMonitor()
 {
     if (!g.monitorThread)
         return;
-    SetEvent(g.stopEvent);        // 通知监控线程退出
-    CloseHandle(g.monitorThread); // 分离：不阻塞 UI，线程退出后自行清理
+    const HANDLE thread = g.monitorThread;
+    const HANDLE stop = g.stopEvent;
     g.monitorThread = nullptr;
-    g.stopEvent = nullptr;        // 事件句柄由监控线程在退出时关闭，避免句柄复用竞态
+    g.stopEvent = nullptr;
+    g.monitorGeneration.fetch_add(1);
+    if (stop)
+        SetEvent(stop);
+    // 等待线程真正退出，避免旧监控线程与新线程重叠或继续使用旧配置。
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    if (stop)
+        CloseHandle(stop);
 }
 
 void ArmMonitor()
@@ -1113,11 +1433,18 @@ void ArmMonitor()
         return;
     }
 
-    auto* ctx = new MonitorCtx{ g.from, g.to, g.hwnd, nullptr, g.paths };
+    const unsigned long long generation = g.monitorGeneration.fetch_add(1) + 1;
+    auto* ctx = new MonitorCtx{ g.from, g.to, g.hwnd, nullptr, generation, g.paths };
     g.stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g.stopEvent) {
+        delete ctx;
+        MessageBoxW(g.hwnd, L"无法创建监控停止事件。", L"错误", MB_ICONERROR);
+        return;
+    }
     ctx->stop = g.stopEvent;
-    g.monitorThread = CreateThread(nullptr, 0, MonitorProc, ctx, 0, nullptr);
-    if (!g.monitorThread) {
+    const uintptr_t t = _beginthreadex(nullptr, 0, MonitorProc, ctx, 0, nullptr);
+    g.monitorThread = reinterpret_cast<HANDLE>(t);
+    if (!t) {
         CloseHandle(g.stopEvent);
         g.stopEvent = nullptr;
         delete ctx;
@@ -1127,10 +1454,33 @@ void ArmMonitor()
     g.monState = MonState::Armed;
     UpdateMonitorButton();
     InvalidatePill();
-    SaveConfig();
+    const bool saved = SaveConfig();
     Log(L"[监控] 已开始: SteamVR 启动时自动把 %lu -> %lu，%s",
         g.from, g.to,
         g.autoSleep ? L"修改完成后自动休眠" : L"修改后不休眠(继续监控)");
+    if (!saved)
+        Log(L"[监控] 警告：当前监控已启动，但配置文件保存失败");
+}
+
+bool SamePaths(const std::vector<PtrPath>& a, const std::vector<PtrPath>& b)
+{
+    if (a.size() != b.size())
+        return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].ToString() != b[i].ToString())
+            return false;
+    return true;
+}
+
+void RestartMonitorAfterConfigChange()
+{
+    if (!g.monitorThread)
+        return;
+    StopMonitor();
+    g.monState = MonState::Standby;
+    UpdateMonitorButton();
+    InvalidatePill();
+    ArmMonitor();
 }
 
 void ToggleMonitor()
@@ -1146,13 +1496,19 @@ void ToggleMonitor()
     }
 }
 
-void OnAutoSleep(wchar_t* text)
+void OnAutoSleep(SleepNotice* notice)
 {
-    if (text) {
-        Log(L"%s", text);
-        TrayBalloon(text);
-        free(text);
+    if (!notice)
+        return;
+    if (notice->generation != g.monitorGeneration.load() || g.exiting.load()) {
+        free(notice->text);
+        delete notice;
+        return;
     }
+    Log(L"%s", notice->text);
+    TrayBalloon(notice->text);
+    free(notice->text);
+    delete notice;
     StopMonitor();
     g.monState = MonState::Sleeping;
     UpdateMonitorButton();
@@ -1213,13 +1569,20 @@ void DoCleanPaths()
     }
 
     g.paths = std::move(keep);
+    g.pathScores.assign(g.paths.size(), 0);
     HWND lv = GetDlgItem(g.hwnd, IDC_LV_PATH);
     ListView_DeleteAllItems(lv);
     for (const PtrPath& p : g.paths)
         AddRow(lv, p.ToString(), L"");
-    SaveConfig();
-    Log(L"[清理] 移除 %d 条失效指针(其中 %d 条无法解析)，保留 %zu 条，已保存配置",
-        removed, failed, g.paths.size());
+    const bool wasMonitoring = g.monitorThread != nullptr;
+    const DWORD oldFrom = g.from;
+    const DWORD oldTo = g.to;
+    const bool saved = SaveConfig();
+    if (saved && wasMonitoring &&
+        (removed > 0 || oldFrom != g.from || oldTo != g.to))
+        RestartMonitorAfterConfigChange();
+    Log(L"[清理] 移除 %d 条失效指针(其中 %d 条无法解析)，保留 %zu 条，%s",
+        removed, failed, g.paths.size(), saved ? L"已保存配置" : L"配置保存失败");
 }
 
 // ---------- 窗口绘制 ----------
@@ -1422,6 +1785,10 @@ void BuildUi()
 
 LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
 {
+    if (g_taskbarCreated && msg == g_taskbarCreated) {
+        AddTrayIcon();
+        return 0;
+    }
     switch (msg) {
         case WM_CREATE: {
             g.hwnd = h;
@@ -1431,7 +1798,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             CreateFonts();
             BuildUi();
             UpdateMonitorButton();
-            AddTrayIcon();
+            if (!AddTrayIcon())
+                Log(L"[托盘] 添加托盘图标失败，Explorer 重启后会自动重试");
             LoadConfig();
             UpdateMonitorButton();
             Log(L"欢迎使用 VD码率修改器");
@@ -1439,7 +1807,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             Log(L"监控时每次 SteamVR 启动自动改码率，改完自动休眠；关闭窗口=隐藏到托盘");
             if (!g.paths.empty()) {
                 ArmMonitor();
-                Log(L"已读取保存的 %zu 条指针路径，监控已自动开始", g.paths.size());
+                if (g.monitorThread)
+                    Log(L"已读取保存的 %zu 条指针路径，监控已自动开始", g.paths.size());
             }
             return 0;
         }
@@ -1540,9 +1909,19 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
         case WM_COMMAND: {
             switch (LOWORD(w)) {
                 case IDC_BTN_MONITOR:  ToggleMonitor(); break;
-                case IDC_BTN_SAVE:     SaveConfig();
-                                       Log(L"配置已保存到 %s", CfgPath().c_str());
-                                       break;
+                case IDC_BTN_SAVE: {
+                    const DWORD oldFrom = g.from;
+                    const DWORD oldTo = g.to;
+                    const std::vector<PtrPath> oldPaths = g.paths;
+                    if (SaveConfig()) {
+                        Log(L"配置已保存到 %s", CfgPath().c_str());
+                        if (g.monitorThread &&
+                            (oldFrom != g.from || oldTo != g.to ||
+                             !SamePaths(oldPaths, g.paths)))
+                            RestartMonitorAfterConfigChange();
+                    }
+                    break;
+                }
                 case IDC_BTN_PATCHALL: DoPatchAll();    break;
                 case IDC_BTN_SCAN:     DoScan();        break;
                 case IDC_BTN_CHANGED:  DoChanged();     break;
@@ -1551,20 +1930,34 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                 case IDC_BTN_TEST:     DoTestPtr();     break;
                 case IDC_BTN_CLEAN:    DoCleanPaths();  break;
                 case IDC_CHK_NOSLEEP:
+                {
+                    const DWORD oldFrom = g.from;
+                    const DWORD oldTo = g.to;
                     g.autoSleep = SendMessageW(
                         GetDlgItem(g.hwnd, IDC_CHK_NOSLEEP), BM_GETCHECK, 0,
                         0) == BST_CHECKED;
-                    SaveConfig();
+                    const bool saved = SaveConfig();
+                    if (saved && g.monitorThread &&
+                        (oldFrom != g.from || oldTo != g.to))
+                        RestartMonitorAfterConfigChange();
                     if (!g.autoSleep)
                         Log(L"[配置] 修改后不休眠: 监控线程持续读写内存, "
                             L"长时间运行可能被小蓝熊(EAC)检测");
                     break;
+                }
                 case IDC_CHK_POPUP:
+                {
+                    const DWORD oldFrom = g.from;
+                    const DWORD oldTo = g.to;
                     g.popupAfter = SendMessageW(
                         GetDlgItem(g.hwnd, IDC_CHK_POPUP), BM_GETCHECK, 0,
                         0) == BST_CHECKED;
-                    SaveConfig();
+                    const bool saved = SaveConfig();
+                    if (saved && g.monitorThread &&
+                        (oldFrom != g.from || oldTo != g.to))
+                        RestartMonitorAfterConfigChange();
                     break;
+                }
             }
             return 0;
         }
@@ -1597,9 +1990,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                     g.s2.clear();
                     g.s3.clear();
                     HWND lv = GetDlgItem(h, IDC_LV_ADDR);
-                    ListView_DeleteAllItems(lv);
-                    for (const ScanMatch& m : g.s1)
-                        AddRow(lv, HexAddr(m.addr), std::to_wstring(m.value));
+                    FillAddressList(lv, g.s1);
                     Log(L"步骤① 完成: 找到 %zu 处数值 = %lu", g.s1.size(),
                         job->from);
                     if (job->truncated)
@@ -1613,9 +2004,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                     g.scanner = std::move(job->scanner);
                     g.s2 = std::move(job->outMatches);
                     HWND lv = GetDlgItem(h, IDC_LV_ADDR);
-                    ListView_DeleteAllItems(lv);
-                    for (const ScanMatch& m : g.s2)
-                        AddRow(lv, HexAddr(m.addr), std::to_wstring(m.value));
+                    FillAddressList(lv, g.s2);
                     Log(L"步骤② 完成: 数值已改变的地址 %zu 处", g.s2.size());
                     Log(L"接下来: 去 VD Streamer 把码率滑块改回 %lu，然后点按钮③",
                         job->from);
@@ -1625,9 +2014,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                     g.scanner = std::move(job->scanner);
                     g.s3 = std::move(job->outMatches);
                     HWND lv = GetDlgItem(h, IDC_LV_ADDR);
-                    ListView_DeleteAllItems(lv);
-                    for (const ScanMatch& m : g.s3)
-                        AddRow(lv, HexAddr(m.addr), std::to_wstring(m.value));
+                    FillAddressList(lv, g.s3);
                     Log(L"步骤③ 完成: 改回后仍保持 %lu 的地址 %zu 处 (即跟随滑块的活地址)",
                         job->from, g.s3.size());
                     if (g.s3.empty())
@@ -1638,11 +2025,14 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                     break;
                 }
                 case JOB_FINDPTR: {
+                    const bool wasMonitoring = g.monitorThread != nullptr;
                     g.scanner = std::move(job->scanner);
                     g.paths = std::move(job->outPaths);
+                    g.pathScores = std::move(job->outPathScores);
                     HWND lv = GetDlgItem(h, IDC_LV_PATH);
                     ListView_DeleteAllItems(lv);
-                    for (const PtrPath& p : g.paths) {
+                    for (size_t i = 0; i < g.paths.size(); ++i) {
+                        const PtrPath& p = g.paths[i];
                         uintptr_t addr = 0;
                         std::wstring val = L"解析失败";
                         if (g.scanner && g.scanner->Resolve(p, &addr)) {
@@ -1650,10 +2040,17 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                             if (g.scanner->Read32(addr, &v))
                                 val = std::to_wstring(v);
                         }
+                        if (i < g.pathScores.size()) {
+                            val += L"  [联合分 ";
+                            val += std::to_wstring(g.pathScores[i]);
+                            val += L"]";
+                        }
                         AddRow(lv, p.ToString(), val);
                     }
                     Log(L"④ 完成: 共 %zu 条静态指针路径。选中一条点⑤测试，然后点「开始监控」",
                         g.paths.size());
+                    if (wasMonitoring)
+                        RestartMonitorAfterConfigChange();
                     break;
                 }
                 case JOB_PATCHALL: {
@@ -1673,9 +2070,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             return 0;
         }
         case WM_SLEEP:
-            OnAutoSleep(reinterpret_cast<wchar_t*>(l));
+            OnAutoSleep(reinterpret_cast<SleepNotice*>(l));
             return 0;
         case WM_SHOW:
+            if (w != static_cast<WPARAM>(g.monitorGeneration.load()))
+                return 0;
             if (IsIconic(h))
                 ShowWindow(h, SW_RESTORE);
             ShowWindow(h, SW_SHOW);
@@ -1729,6 +2128,21 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             nid.uID    = kTrayId;
             Shell_NotifyIconW(NIM_DELETE, &nid);
             StopMonitor();
+            if (g.jobThread) {
+                WaitForSingleObject(g.jobThread, INFINITE);
+                CloseHandle(g.jobThread);
+                g.jobThread = nullptr;
+            }
+            MSG pending{};
+            while (PeekMessageW(&pending, h, WM_SLEEP, WM_SLEEP, PM_REMOVE)) {
+                auto* notice = reinterpret_cast<SleepNotice*>(pending.lParam);
+                if (notice) {
+                    free(notice->text);
+                    delete notice;
+                }
+            }
+            while (PeekMessageW(&pending, h, WM_LOGMSG, WM_LOGMSG, PM_REMOVE))
+                free(reinterpret_cast<wchar_t*>(pending.lParam));
             g.scanner.reset();
             DestroyFonts();
             if (g.appIcon) DestroyIcon(g.appIcon);
@@ -1779,6 +2193,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
 
     ResolveCfgDir();
     InitDarkMode();
+    g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_LISTVIEW_CLASSES };
     InitCommonControlsEx(&icc);
 

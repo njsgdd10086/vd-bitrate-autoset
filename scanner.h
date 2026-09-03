@@ -20,8 +20,26 @@ struct PtrPath {
     static bool Parse(const std::wstring& text, PtrPath& out);
 };
 
+struct PtrScanStats {
+    size_t levels = 0;
+    size_t matches = 0;
+    size_t kept = 0;
+    size_t dropped = 0;
+    size_t moduleRoots = 0;
+    size_t otherModuleRoots = 0;
+    size_t readOnlyModuleMatches = 0;
+    size_t otherModuleMatches = 0;
+    size_t nonModuleMatches = 0;
+    bool truncated = false;
+    bool timedOut = false;
+    bool cancelled = false;
+    bool unaligned = false;
+};
+
 class VdScanner {
 public:
+    using CancelCheck = bool (*)(void* ctx);
+
     explicit VdScanner(DWORD pid);
     ~VdScanner();
     VdScanner(const VdScanner&) = delete;
@@ -34,7 +52,9 @@ public:
 
     // 全内存精确扫描 value；maxResults>0 时达到上限即停止，truncated 标记是否被截断
     std::vector<ScanMatch> ScanValue(uint32_t value, size_t maxResults = 0,
-                                     bool* truncated = nullptr) const;
+                                     bool* truncated = nullptr,
+                                     CancelCheck cancel = nullptr,
+                                     void* cancelCtx = nullptr) const;
     bool Read32(uintptr_t addr, uint32_t* out) const;
     bool Write32(uintptr_t addr, uint32_t v) const;
 
@@ -44,15 +64,24 @@ public:
     using PtrScanProgress = void (*)(void* ctx, int depth, size_t candidates,
                                      DWORD elapsedMs);
     std::vector<PtrPath> FindPointerPaths(uintptr_t leaf, int maxDepth,
-                                          size_t maxNodes,
-                                          DWORD timeLimitMs = 0,
-                                          PtrScanProgress progress = nullptr,
-                                          void* progressCtx = nullptr) const;
+                                           size_t maxNodes,
+                                           DWORD timeLimitMs = 0,
+                                           PtrScanProgress progress = nullptr,
+                                           void* progressCtx = nullptr,
+                                           CancelCheck cancel = nullptr,
+                                           void* cancelCtx = nullptr,
+                                           PtrScanStats* stats = nullptr,
+                                           bool scanUnaligned = false) const;
     // 按路径解析出最终地址
     bool Resolve(const PtrPath& path, uintptr_t* finalAddr) const;
 
 private:
-    struct Region { uintptr_t base; SIZE_T size; };
+    struct Region {
+        uintptr_t base;
+        SIZE_T size;
+        DWORD protect;
+        DWORD type;
+    };
     struct ModInfo { uintptr_t base; SIZE_T size; std::wstring name; };
 
     DWORD pid_ = 0;
