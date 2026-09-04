@@ -301,6 +301,86 @@ bool VdScanner::Write32(uintptr_t addr, uint32_t v) const
                               sizeof(v), &wb) && wb == sizeof(v);
 }
 
+std::vector<uintptr_t> VdScanner::FindValuePatterns(
+    uint32_t value, const std::vector<uintptr_t>& offsets, size_t maxGroups,
+    bool* truncated, CancelCheck cancel, void* cancelCtx) const
+{
+    std::vector<uintptr_t> groups;
+    if (truncated)
+        *truncated = false;
+    if (offsets.empty())
+        return groups;
+
+    bool hasZero = false;
+    uintptr_t maxOffset = 0;
+    for (uintptr_t off : offsets) {
+        if (off == 0)
+            hasZero = true;
+        if (off > maxOffset)
+            maxOffset = off;
+    }
+    if (!hasZero || maxOffset > (std::numeric_limits<uintptr_t>::max)() - sizeof(uint32_t))
+        return groups;
+
+    std::vector<ScanMatch> matches =
+        ScanValue(value, 0, nullptr, cancel, cancelCtx);
+    if (cancel && cancel(cancelCtx))
+        return groups;
+    std::sort(matches.begin(), matches.end(),
+              [](const ScanMatch& a, const ScanMatch& b) {
+                  return a.addr < b.addr;
+              });
+    matches.erase(std::unique(matches.begin(), matches.end(),
+                              [](const ScanMatch& a, const ScanMatch& b) {
+                                  return a.addr == b.addr;
+                              }),
+                  matches.end());
+    std::vector<uintptr_t> addresses;
+    addresses.reserve(matches.size());
+    for (const ScanMatch& m : matches)
+        addresses.push_back(m.addr);
+
+    auto writable = [&](uintptr_t addr) {
+        for (const Region& r : regions_) {
+            if (addr < r.base)
+                continue;
+            const uintptr_t delta = addr - r.base;
+            if (delta <= r.size && sizeof(uint32_t) <= r.size - delta)
+                return IsWritableProtect(r.protect);
+        }
+        return false;
+    };
+
+    for (uintptr_t base : addresses) {
+        if (cancel && cancel(cancelCtx))
+            break;
+        if (!writable(base))
+            continue;
+        bool found = true;
+        for (uintptr_t off : offsets) {
+            if (off > (std::numeric_limits<uintptr_t>::max)() - base) {
+                found = false;
+                break;
+            }
+            const uintptr_t addr = base + off;
+            if (!std::binary_search(addresses.begin(), addresses.end(), addr) ||
+                !writable(addr)) {
+                found = false;
+                break;
+            }
+        }
+        if (!found)
+            continue;
+        if (maxGroups && groups.size() >= maxGroups) {
+            if (truncated)
+                *truncated = true;
+            break;
+        }
+        groups.push_back(base);
+    }
+    return groups;
+}
+
 std::vector<PtrPath> VdScanner::FindPointerPaths(uintptr_t leaf, int maxDepth,
                                                  size_t maxNodes,
                                                  DWORD timeLimitMs,
@@ -479,7 +559,7 @@ std::vector<PtrPath> VdScanner::FindPointerPaths(uintptr_t leaf, int maxDepth,
             }
         }
         targets = std::move(next);
-        if (result.size() >= 500)
+        if (result.size() >= 10000)
             break;
     }
     if (stats) {

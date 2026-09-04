@@ -58,6 +58,12 @@ public:
     bool Read32(uintptr_t addr, uint32_t* out) const;
     bool Write32(uintptr_t addr, uint32_t v) const;
 
+    // 查找同一可写区域内按给定相对偏移同时出现的 value，返回每组基址。
+    std::vector<uintptr_t> FindValuePatterns(
+        uint32_t value, const std::vector<uintptr_t>& offsets,
+        size_t maxGroups = 0, bool* truncated = nullptr,
+        CancelCheck cancel = nullptr, void* cancelCtx = nullptr) const;
+
     // 从 leaf 地址反向查找指针链，返回所有静态可达路径
     // timeLimitMs > 0 时整个叶扫描限时，超时提前返回已找到的结果；
     // progress 每层开始时回调(depth, 候选数, 已用毫秒)，用于日志进度

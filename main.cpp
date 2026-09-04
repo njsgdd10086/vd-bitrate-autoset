@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +42,7 @@
 #include <process.h>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "scanner.h"
@@ -55,6 +57,7 @@ namespace {
 
 constexpr DWORD kDefaultFrom = 10000000;
 constexpr DWORD kDefaultTo   = 800000000;
+constexpr wchar_t kAppVersion[] = L"v1.2.0";
 
 // ---------- 主题色 ----------
 constexpr COLORREF kBg          = RGB(20, 22, 26);
@@ -86,7 +89,7 @@ enum {
     IDC_EDIT_TO,
     IDC_BTN_MONITOR,
     IDC_BTN_SAVE,
-    IDC_BTN_PATCHALL,
+    IDC_BTN_VALIDATE,
     IDC_BTN_SCAN,
     IDC_BTN_CHANGED,
     IDC_BTN_RESTORED,
@@ -98,14 +101,18 @@ enum {
     IDC_LOG,
     IDC_CHK_NOSLEEP,
     IDC_CHK_POPUP,
-    IDC_LBL_WARN,
+    IDC_CHK_PATTERN,
 };
 
-// 单次扫描/全量修改的结果上限，防止数值过于常见时 UI 卡死
+// 单次扫描结果上限，防止数值过于常见时 UI 卡死
 constexpr size_t kMaxScanResults = 1000000;
 // ListView 逐条插入大量项目会阻塞 UI；完整结果仍保留在内存中供后续差分。
 constexpr size_t kMaxDisplayedResults = 20000;
-constexpr size_t kPointerMaxNodes = 128;
+constexpr size_t kMaxDisplayedPaths = 2000;
+constexpr size_t kPointerMaxNodes = 65536;
+constexpr size_t kMaxPatternGroups = 8;
+constexpr int kPointerMaxDepth = 8;
+constexpr int kStableRoundsRequired = 2;
 
 constexpr UINT WM_TRAY   = WM_APP + 10;
 constexpr UINT WM_LOGMSG = WM_APP + 1;
@@ -139,6 +146,9 @@ struct AppState {
     std::vector<ScanMatch> s1, s2, s3;
     std::vector<PtrPath> paths;
     std::vector<int> pathScores;
+    std::vector<uintptr_t> valuePattern;
+    int stableRounds = 0;
+    DWORD pathOriginPid = 0;
     DWORD from = kDefaultFrom;
     DWORD to   = kDefaultTo;
 
@@ -151,6 +161,7 @@ struct AppState {
     std::atomic<unsigned long long> monitorGeneration{0};
     std::atomic<bool> autoSleep{true};   // 修改后自动休眠(勾选; 关闭则继续监控, 有被EAC检测风险)
     std::atomic<bool> popupAfter{true};  // 修改后自动弹出主窗口
+    std::atomic<bool> patternFallback{true}; // 指针失效时启用结构模式回退
     HFONT smallFont       = nullptr;
     std::atomic<bool> exiting{false};    // 真正退出标志(后台任务据此自查自删)
 };
@@ -704,30 +715,202 @@ const wchar_t* PillText()
     switch (g.monState) {
         case MonState::Armed:    return L"监控中 · 等待 SteamVR 启动...";
         case MonState::Sleeping: return L"休眠中 · 点击「开始监控」后继续监听 SteamVR";
-        default:                 return L"待机 · 完成 ④ 生成指针路径后点击「开始监控」";
+        default:                 return L"待机 · 完成④并通过重启验证后点击「开始监控」";
     }
 }
 
 // ---------- 差分三步 ----------
 
 // ---------- 后台任务 ----------
-// 扫描类操作(①~④/全量)都较慢，统一放到工作线程执行，避免 UI 假死白屏。
+// 扫描类操作(①~④/⑦)都较慢，统一放到工作线程执行，避免 UI 假死白屏。
 // 结果通过 WM_JOB 投递回 UI 线程统一应用；任务期间禁用相关按钮。
 
-enum JobKind { JOB_SCAN = 1, JOB_CHANGED, JOB_RESTORED, JOB_FINDPTR, JOB_PATCHALL };
+enum JobKind { JOB_SCAN = 1, JOB_CHANGED, JOB_RESTORED, JOB_FINDPTR, JOB_VALIDATE };
 
 struct ScanJob {
     int kind = 0;
     DWORD from = 0, to = 0;
     std::vector<ScanMatch> inMatches;
     std::vector<ScanMatch> outMatches;
+    std::vector<PtrPath> inPaths;
+    std::vector<uintptr_t> inLeaves;
+    size_t validatedLeaves = 0;
     std::vector<PtrPath> outPaths;
     std::vector<int> outPathScores;
     std::wstring outErr;
     int patched = 0;
+    DWORD originPid = 0;
     bool truncated = false;   // ScanValue 结果被上限截断
     std::unique_ptr<VdScanner> scanner;
 };
+
+bool ParsePatternNumber(const std::wstring& text, uintptr_t* out)
+{
+    if (!out || text.empty())
+        return false;
+    std::wstring value = text;
+    bool hex = false;
+    if (value.size() > 2 && value[0] == L'0' &&
+        (value[1] == L'x' || value[1] == L'X')) {
+        value.erase(0, 2);
+        hex = true;
+    }
+    if (value.empty())
+        return false;
+    for (wchar_t c : value) {
+        const bool digit = (c >= L'0' && c <= L'9') ||
+                           (c >= L'a' && c <= L'f') ||
+                           (c >= L'A' && c <= L'F');
+        if (!digit)
+            return false;
+        if ((c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F'))
+            hex = true;
+    }
+    wchar_t* end = nullptr;
+    errno = 0;
+    const unsigned long long number =
+        wcstoull(value.c_str(), &end, hex ? 16 : 10);
+    if (errno == ERANGE || !end || *end != L'\0' ||
+        number > (std::numeric_limits<uintptr_t>::max)())
+        return false;
+    *out = static_cast<uintptr_t>(number);
+    return true;
+}
+
+void FillPathList(HWND lv, const std::vector<PtrPath>& paths,
+                  const std::vector<int>* scores = nullptr,
+                  const VdScanner* scanner = nullptr, int verifiedRound = 0)
+{
+    ListView_DeleteAllItems(lv);
+    const size_t shown = (std::min)(paths.size(), kMaxDisplayedPaths);
+    for (size_t i = 0; i < shown; ++i) {
+        std::wstring value;
+        if (scanner) {
+            uintptr_t addr = 0;
+            uint32_t v = 0;
+            value = (scanner->Resolve(paths[i], &addr) &&
+                     scanner->Read32(addr, &v))
+                        ? std::to_wstring(v) : L"解析失败";
+        } else if (verifiedRound > 0) {
+            value = L"已验证第 " + std::to_wstring(verifiedRound) + L" 轮";
+        }
+        if (scores && i < scores->size()) {
+            if (!value.empty())
+                value += L"  ";
+            value += L"[联合分 " + std::to_wstring((*scores)[i]) + L"]";
+        }
+        AddRow(lv, paths[i].ToString(), value);
+    }
+    if (shown < paths.size()) {
+        AddRow(lv, L"…（其余路径已保留，未在列表显示）",
+               std::to_wstring(paths.size() - shown));
+    }
+}
+
+bool ParsePattern(const std::wstring& text, std::vector<uintptr_t>* out)
+{
+    if (!out || text.empty())
+        return false;
+    std::vector<uintptr_t> values;
+    std::wstring rest = text;
+    size_t pos = 0;
+    while ((pos = rest.find(L':')) != std::wstring::npos) {
+        const std::wstring part = rest.substr(0, pos);
+        if (part.empty())
+            return false;
+        uintptr_t value = 0;
+        if (!ParsePatternNumber(part, &value))
+            return false;
+        values.push_back(value);
+        rest.erase(0, pos + 1);
+    }
+    if (rest.empty())
+        return false;
+    uintptr_t value = 0;
+    if (!ParsePatternNumber(rest, &value))
+        return false;
+    values.push_back(value);
+    if (values.empty() || values.size() > 16 || values.front() != 0)
+        return false;
+    for (size_t i = 1; i < values.size(); ++i)
+        if (values[i] <= values[i - 1])
+            return false;
+    *out = std::move(values);
+    return true;
+}
+
+std::wstring PatternToString(const std::vector<uintptr_t>& pattern)
+{
+    std::wstring out;
+    wchar_t buf[32];
+    for (uintptr_t offset : pattern) {
+        swprintf_s(buf, _countof(buf), L"0x%llX",
+                   static_cast<unsigned long long>(offset));
+        if (!out.empty())
+            out += L":";
+        out += buf;
+    }
+    return out;
+}
+
+std::vector<uintptr_t> DeriveValuePattern(const std::vector<ScanMatch>& matches)
+{
+    if (matches.size() < 3)
+        return {};
+    std::vector<uintptr_t> addresses;
+    addresses.reserve(matches.size());
+    for (const ScanMatch& match : matches)
+        addresses.push_back(match.addr);
+    std::sort(addresses.begin(), addresses.end());
+    addresses.erase(std::unique(addresses.begin(), addresses.end()), addresses.end());
+
+    size_t bestStart = 0;
+    size_t bestLength = 0;
+    for (size_t i = 0; i < addresses.size();) {
+        size_t j = i + 1;
+        while (j < addresses.size() && addresses[j] - addresses[j - 1] == sizeof(uint32_t))
+            ++j;
+        if (j - i > bestLength) {
+            bestStart = i;
+            bestLength = j - i;
+        }
+        i = j;
+    }
+    if (bestLength < 3)
+        return {};
+    bestLength = (std::min)(bestLength, size_t(8));
+    std::vector<uintptr_t> pattern;
+    pattern.reserve(bestLength);
+    for (size_t i = 0; i < bestLength; ++i)
+        pattern.push_back(addresses[bestStart + i] - addresses[bestStart]);
+    return pattern;
+}
+
+std::vector<uintptr_t> DerivePatternFromPaths(const std::vector<PtrPath>& paths)
+{
+    std::map<std::wstring, std::vector<uintptr_t>> groups;
+    for (const PtrPath& path : paths) {
+        if (path.hops.empty())
+            continue;
+        PtrPath prefix = path;
+        const uintptr_t last = prefix.hops.back();
+        prefix.hops.pop_back();
+        groups[prefix.ToString()].push_back(last);
+    }
+    for (auto& group : groups) {
+        auto& offsets = group.second;
+        std::sort(offsets.begin(), offsets.end());
+        offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+        for (uintptr_t base : offsets) {
+            if (base > (std::numeric_limits<uintptr_t>::max)() - 8)
+                continue;
+            if (std::binary_search(offsets.begin(), offsets.end(), base + 4) &&
+                std::binary_search(offsets.begin(), offsets.end(), base + 8))
+                return {0, 4, 8};
+        }
+    }
+    return {};
+}
 
 struct LeafPath {
     PtrPath path;
@@ -830,11 +1013,19 @@ bool IsJobCancelled(void*)
     return g.exiting.load();
 }
 
+bool IsMonitorCancelled(void* ctx)
+{
+    if (g.exiting.load())
+        return true;
+    const HANDLE stop = static_cast<HANDLE>(ctx);
+    return stop && WaitForSingleObject(stop, 0) == WAIT_OBJECT_0;
+}
+
 void SetJobUi(bool enabled)
 {
     for (int id : { IDC_BTN_SCAN, IDC_BTN_CHANGED, IDC_BTN_RESTORED,
                     IDC_BTN_FINDPTR, IDC_BTN_TEST, IDC_BTN_CLEAN,
-                    IDC_BTN_PATCHALL, IDC_BTN_SAVE })
+                    IDC_BTN_VALIDATE, IDC_BTN_SAVE })
         EnableWindow(GetDlgItem(g.hwnd, id), enabled);
 }
 
@@ -858,7 +1049,14 @@ void RunJob(int kind, std::vector<ScanMatch> in = {})
     job->from = from;
     job->to = to;
     job->inMatches = std::move(in);
-    if (g.scanner)
+    if (kind == JOB_VALIDATE) {
+        job->inPaths = g.paths;
+        job->originPid = g.pathOriginPid;
+        job->inLeaves.reserve(g.s3.size());
+        for (const ScanMatch& match : g.s3)
+            job->inLeaves.push_back(match.addr);
+    }
+    if (g.scanner && kind != JOB_VALIDATE)
         job->scanner = std::move(g.scanner);
 
     const uintptr_t t = _beginthreadex(nullptr, 0, JobProc, job, 0, nullptr);
@@ -935,13 +1133,15 @@ unsigned __stdcall JobProc(void* lp)
                 if (g.exiting.load())
                     break;
                 swprintf_s(buf, _countof(buf),
-                           L"  叶地址 %s: 反向扫描指针链(最多4层,每叶限时180秒)...",
-                           HexAddr(job->inMatches[i].addr).c_str());
+                            L"  叶地址 %s: 反向扫描指针链(最多%d层,每叶限时180秒)...",
+                           HexAddr(job->inMatches[i].addr).c_str(),
+                           kPointerMaxDepth);
                 ThreadLog(g.hwnd, buf);
                 const DWORD t0 = GetTickCount();
                 PtrScanStats stats{};
                 std::vector<PtrPath> found =
-                    job->scanner->FindPointerPaths(job->inMatches[i].addr, 4,
+                    job->scanner->FindPointerPaths(job->inMatches[i].addr,
+                                                    kPointerMaxDepth,
                                                     kPointerMaxNodes, 180000,
                                                     PtrScanProgressCb,
                                                     g.hwnd,
@@ -991,7 +1191,8 @@ unsigned __stdcall JobProc(void* lp)
                     const DWORD looseT0 = GetTickCount();
                     const std::vector<PtrPath> loose =
                         job->scanner->FindPointerPaths(
-                            job->inMatches[i].addr, 4, kPointerMaxNodes, 180000,
+                            job->inMatches[i].addr, kPointerMaxDepth,
+                            kPointerMaxNodes, 180000,
                             PtrScanProgressCb, g.hwnd, IsJobCancelled, nullptr,
                             &looseStats, true);
                     for (const PtrPath& p : loose)
@@ -1031,7 +1232,9 @@ unsigned __stdcall JobProc(void* lp)
             ThreadLog(g.hwnd, buf);
             break;
         }
-        case JOB_PATCHALL: {
+        case JOB_VALIDATE: {
+            if (job->inPaths.empty() || job->inLeaves.empty())
+                break;
             if (!job->scanner) {
                 const DWORD pid = FindPidByName(kVdStreamer);
                 if (pid == 0) {
@@ -1045,15 +1248,45 @@ unsigned __stdcall JobProc(void* lp)
                 }
                 job->scanner = std::move(sc);
             }
-            for (const ScanMatch& m :
-                 job->scanner->ScanValue(job->from, kMaxScanResults,
-                                         &job->truncated,
-                                         IsJobCancelled, nullptr)) {
+            if (job->originPid && job->scanner->Pid() == job->originPid) {
+                job->outErr = L"当前仍是生成路径时的同一进程，请先重启 VD Streamer 后重新执行①→③。";
+                break;
+            }
+            std::vector<LeafPath> candidates;
+            std::set<size_t> matchedLeaves;
+            for (const PtrPath& path : job->inPaths) {
                 if (g.exiting.load())
                     break;
-                if (job->scanner->Write32(m.addr, job->to))
-                    ++job->patched;
+                uintptr_t addr = 0;
+                if (!job->scanner->Resolve(path, &addr))
+                    continue;
+                uint32_t value = 0;
+                if (!job->scanner->Read32(addr, &value) || value != job->from)
+                    continue;
+                for (size_t i = 0; i < job->inLeaves.size(); ++i) {
+                    if (addr == job->inLeaves[i]) {
+                        candidates.push_back({path, addr, i});
+                        matchedLeaves.insert(i);
+                        break;
+                    }
+                }
             }
+            std::vector<PtrPath> ranked;
+            std::vector<int> scores;
+            RankLeafPaths(*job->scanner, candidates, ranked, scores);
+            const int threshold = job->inLeaves.size() >= 3 ? 400 : 200;
+            if (matchedLeaves.size() != job->inLeaves.size()) {
+                job->outPaths.clear();
+                job->outPathScores.clear();
+            } else {
+                for (size_t i = 0; i < scores.size(); ++i) {
+                    if (scores[i] >= threshold) {
+                        job->outPaths.push_back(ranked[i]);
+                        job->outPathScores.push_back(scores[i]);
+                    }
+                }
+            }
+            job->validatedLeaves = matchedLeaves.size();
             break;
         }
     }
@@ -1095,6 +1328,24 @@ void DoFindPtr()
         return;
     }
     RunJob(JOB_FINDPTR, g.s3);
+}
+
+void DoValidatePaths()
+{
+    if (g.paths.empty()) {
+        MessageBoxW(g.hwnd, L"当前没有待验证的候选指针，请先执行④。", L"提示",
+                    MB_ICONINFORMATION);
+        return;
+    }
+    if (g.stableRounds >= kStableRoundsRequired)
+        Log(L"[验证] 当前路径已连续通过 %d 轮验证", g.stableRounds);
+    if (g.s3.empty()) {
+        MessageBoxW(g.hwnd,
+                    L"请在重启 VD/SteamVR 后重新完成①→②→③，再执行验证。",
+                    L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    RunJob(JOB_VALIDATE);
 }
 
 void DoTestPtr()
@@ -1232,6 +1483,10 @@ bool SaveConfig()
     f << L"to=" << g.to << L"\n";
     f << L"nosleep=" << (g.autoSleep ? 0 : 1) << L"\n";
     f << L"popup_after=" << (g.popupAfter ? 1 : 0) << L"\n";
+    f << L"pattern_fallback=" << (g.patternFallback ? 1 : 0) << L"\n";
+    f << L"stable_rounds=" << g.stableRounds << L"\n";
+    if (!g.valuePattern.empty())
+        f << L"pattern=" << PatternToString(g.valuePattern) << L"\n";
     for (const PtrPath& p : g.paths)
         f << L"path=" << p.ToString() << L"\n";
     f.flush();
@@ -1255,6 +1510,8 @@ void LoadConfig()
 {
     g.paths.clear();
     g.pathScores.clear();
+    g.valuePattern.clear();
+    g.stableRounds = 0;
     std::wifstream f(CfgPath());
     int invalid = 0;
     if (f) {
@@ -1286,6 +1543,26 @@ void LoadConfig()
                     g.popupAfter = value != L"0";
                 else
                     ++invalid;
+            } else if (line.rfind(L"pattern_fallback=", 0) == 0) {
+                const std::wstring value = line.substr(17);
+                if (value == L"0" || value == L"1")
+                    g.patternFallback = value != L"0";
+                else
+                    ++invalid;
+            } else if (line.rfind(L"stable_rounds=", 0) == 0) {
+                const std::wstring value = line.substr(14);
+                wchar_t* end = nullptr;
+                const unsigned long long rounds = wcstoull(value.c_str(), &end, 10);
+                if (!end || *end != L'\0' || rounds > 1000)
+                    ++invalid;
+                else
+                    g.stableRounds = static_cast<int>(rounds);
+            } else if (line.rfind(L"pattern=", 0) == 0) {
+                std::vector<uintptr_t> pattern;
+                if (ParsePattern(line.substr(8), &pattern))
+                    g.valuePattern = std::move(pattern);
+                else
+                    ++invalid;
             } else if (line.rfind(L"path=", 0) == 0) {
                 PtrPath p;
                 if (PtrPath::Parse(line.substr(5), p))
@@ -1295,6 +1572,8 @@ void LoadConfig()
             }
         }
     }
+    if (g.valuePattern.empty())
+        g.valuePattern = DerivePatternFromPaths(g.paths);
     SetEditText(IDC_EDIT_FROM, std::to_wstring(g.from));
     SetEditText(IDC_EDIT_TO, std::to_wstring(g.to));
     SendMessageW(GetDlgItem(g.hwnd, IDC_CHK_NOSLEEP), BM_SETCHECK,
@@ -1303,9 +1582,11 @@ void LoadConfig()
     SendMessageW(GetDlgItem(g.hwnd, IDC_CHK_POPUP), BM_SETCHECK,
                  g.popupAfter ? BST_CHECKED : BST_UNCHECKED, 0);
     InvalidateRect(GetDlgItem(g.hwnd, IDC_CHK_POPUP), nullptr, TRUE);
+    SendMessageW(GetDlgItem(g.hwnd, IDC_CHK_PATTERN), BM_SETCHECK,
+                 g.patternFallback ? BST_CHECKED : BST_UNCHECKED, 0);
+    InvalidateRect(GetDlgItem(g.hwnd, IDC_CHK_PATTERN), nullptr, TRUE);
     HWND lv = GetDlgItem(g.hwnd, IDC_LV_PATH);
-    for (const PtrPath& p : g.paths)
-        AddRow(lv, p.ToString(), L"");
+    FillPathList(lv, g.paths);
     g.pathScores.assign(g.paths.size(), 0);
     if (invalid)
         Log(L"[配置] 忽略 %d 条格式无效的配置项", invalid);
@@ -1319,6 +1600,9 @@ struct MonitorCtx {
     HANDLE stop;
     unsigned long long generation;
     std::vector<PtrPath> paths;
+    std::vector<uintptr_t> valuePattern;
+    bool patternFallback;
+    bool stablePaths;
 };
 
 struct SleepNotice {
@@ -1339,7 +1623,10 @@ unsigned __stdcall MonitorProc(void* lp)
                 if (sc.Attach()) {
                     int done = 0;
                     int resolved = 0;
+                    int readMatches = 0;
                     int toMatches = 0;
+                    bool usedPattern = false;
+                    if (ctx->stablePaths) {
                     for (const PtrPath& p : ctx->paths) {
                         uintptr_t addr = 0;
                         if (!sc.Resolve(p, &addr))
@@ -1347,6 +1634,7 @@ unsigned __stdcall MonitorProc(void* lp)
                         ++resolved;
                         uint32_t v = 0;
                         if (sc.Read32(addr, &v)) {
+                            ++readMatches;
                             if (v == ctx->from) {
                                 if (sc.Write32(addr, ctx->to))
                                     ++done;
@@ -1355,13 +1643,74 @@ unsigned __stdcall MonitorProc(void* lp)
                             }
                         }
                     }
-                    const bool complete = done > 0 ||
-                                          (resolved > 0 && toMatches == resolved);
+                    }
+                    bool complete = !ctx->paths.empty() &&
+                                    resolved == static_cast<int>(ctx->paths.size()) &&
+                                    readMatches == resolved &&
+                                    done + toMatches == resolved;
+                    if (!complete && ctx->patternFallback &&
+                        !ctx->valuePattern.empty()) {
+                        bool patternTruncated = false;
+                        const std::vector<uintptr_t> bases = sc.FindValuePatterns(
+                            ctx->from, ctx->valuePattern, kMaxPatternGroups,
+                            &patternTruncated, IsMonitorCancelled, ctx->stop);
+                        int patternDone = 0;
+                        int patternTo = 0;
+                        if (bases.size() == 1) {
+                            const uintptr_t base = bases.front();
+                            std::vector<std::pair<uintptr_t, uint32_t>> patternValues;
+                            patternValues.reserve(ctx->valuePattern.size());
+                            bool patternReadable = true;
+                            for (uintptr_t offset : ctx->valuePattern) {
+                                if (IsMonitorCancelled(ctx->stop)) {
+                                    patternReadable = false;
+                                    break;
+                                }
+                                if (offset > (std::numeric_limits<uintptr_t>::max)() - base) {
+                                    patternReadable = false;
+                                    continue;
+                                }
+                                uint32_t v = 0;
+                                const uintptr_t addr = base + offset;
+                                if (!sc.Read32(addr, &v) ||
+                                    (v != ctx->from && v != ctx->to)) {
+                                    patternReadable = false;
+                                    continue;
+                                }
+                                patternValues.push_back({addr, v});
+                            }
+                            if (patternReadable &&
+                                patternValues.size() == ctx->valuePattern.size()) {
+                                for (const auto& item : patternValues) {
+                                    if (item.second == ctx->from) {
+                                        if (sc.Write32(item.first, ctx->to))
+                                            ++patternDone;
+                                    } else {
+                                        ++patternTo;
+                                    }
+                                }
+                            }
+                        }
+                        if (patternDone + patternTo ==
+                            static_cast<int>(ctx->valuePattern.size())) {
+                            done += patternDone;
+                            complete = true;
+                            usedPattern = true;
+                            ThreadLog(ctx->hwnd,
+                                      L"[监控] 静态指针路径已失效，结构模式重新定位成功");
+                        }
+                        if (bases.size() > 1) {
+                            ThreadLog(ctx->hwnd, L"[监控] 结构模式命中多个候选，未自动写入，避免误改");
+                        }
+                        if (patternTruncated)
+                            ThreadLog(ctx->hwnd, L"[监控] 结构模式命中超过上限，已截断");
+                    }
                     if (!complete)
                         continue;
                     wchar_t msg[256];
                     swprintf_s(msg, _countof(msg),
-                               L"SteamVR 启动，已修改 %d 处码率 %lu -> %lu",
+                               L"SteamVR 启动，%s修改 %d 处码率 %lu -> %lu",
+                               usedPattern ? L"通过结构模式 " : L"",
                                done, ctx->from, ctx->to);
                     ThreadLog(ctx->hwnd, msg);
                     if (!g.exiting.load() && g.popupAfter.load())
@@ -1420,9 +1769,17 @@ void ArmMonitor()
 {
     if (g.monitorThread)
         return;
-    if (g.paths.empty()) {
+    if (g.paths.empty() && g.valuePattern.empty()) {
         MessageBoxW(g.hwnd,
-                    L"当前没有已保存的指针路径，请先完成 ④ 查找指针路径。",
+                    L"当前没有已保存的指针路径或结构模式，请先完成 ④ 查找指针路径。",
+                    L"提示", MB_ICONINFORMATION);
+        return;
+    }
+    if (!g.paths.empty() && g.stableRounds < kStableRoundsRequired &&
+        (!g.patternFallback.load() || g.valuePattern.empty())) {
+        MessageBoxW(g.hwnd,
+                    L"当前指针尚未通过多轮重启验证，且结构模式回退已关闭；"
+                    L"请先完成验证，或开启「指针失效时结构定位」。",
                     L"提示", MB_ICONINFORMATION);
         return;
     }
@@ -1434,7 +1791,9 @@ void ArmMonitor()
     }
 
     const unsigned long long generation = g.monitorGeneration.fetch_add(1) + 1;
-    auto* ctx = new MonitorCtx{ g.from, g.to, g.hwnd, nullptr, generation, g.paths };
+    auto* ctx = new MonitorCtx{ g.from, g.to, g.hwnd, nullptr, generation,
+                                g.paths, g.valuePattern, g.patternFallback.load(),
+                                g.stableRounds >= kStableRoundsRequired };
     g.stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g.stopEvent) {
         delete ctx;
@@ -1516,11 +1875,6 @@ void OnAutoSleep(SleepNotice* notice)
     Log(L"[监控] 修改完成，已自动休眠。需要再次监控时点击「开始监控」按钮");
 }
 
-void DoPatchAll()
-{
-    RunJob(JOB_PATCHALL);
-}
-
 // 清除失效指针：解析每条已保存路径并读取当前值，移除无法解析或值既非 from
 // 也非 to 的路径(值为 to 说明已修改成功、仍是有效路径，予以保留)。
 void DoCleanPaths()
@@ -1572,8 +1926,7 @@ void DoCleanPaths()
     g.pathScores.assign(g.paths.size(), 0);
     HWND lv = GetDlgItem(g.hwnd, IDC_LV_PATH);
     ListView_DeleteAllItems(lv);
-    for (const PtrPath& p : g.paths)
-        AddRow(lv, p.ToString(), L"");
+    FillPathList(lv, g.paths);
     const bool wasMonitoring = g.monitorThread != nullptr;
     const DWORD oldFrom = g.from;
     const DWORD oldTo = g.to;
@@ -1646,6 +1999,16 @@ void DrawStatusPill(HDC dc)
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
+void DrawVersion(HDC dc)
+{
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, kTextDim);
+    SelectObject(dc, g.smallFont);
+    RECT rc{ S(kW - 150), S(kH - 28), S(kW - 14), S(kH - 8) };
+    DrawTextW(dc, kAppVersion, -1, &rc,
+              DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
+
 // ---------- 字体与 DPI ----------
 
 void CreateFonts()
@@ -1680,10 +2043,6 @@ void ApplyFonts()
 {
     for (HWND c = GetWindow(g.hwnd, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
         SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
-    HWND warn = GetDlgItem(g.hwnd, IDC_LBL_WARN);
-    if (warn)
-        SendMessageW(warn, WM_SETFONT,
-                     reinterpret_cast<WPARAM>(g.smallFont), TRUE);
 }
 
 // PerMonitorV2 下跨显示器拖动时动态重算缩放、字号与布局
@@ -1741,16 +2100,15 @@ void BuildUi()
     MakeButton(h, IDC_BTN_MONITOR, L"▶ 开始监控", S(14), S(114), S(176), S(38),
                kAccent, kAccentHover, kAccentDown);
     MakeButton(h, IDC_BTN_SAVE, L"保存路径", S(198), S(114), S(110), S(38));
-    MakeButton(h, IDC_BTN_PATCHALL, L"全量修改", S(316), S(114), S(130), S(38));
+    MakeButton(h, IDC_BTN_VALIDATE, L"⑦ 重启验证", S(316), S(114), S(130), S(38));
 
     // 修改后行为开关
     MakeCheckbox(h, IDC_CHK_POPUP, L"修改后弹出窗口", S(460), S(116), S(135),
                  S(34));
     MakeCheckbox(h, IDC_CHK_NOSLEEP, L"修改后自动休眠", S(605), S(116), S(135),
                  S(34));
-    HWND warn = MakeCaption(h, L"⚠ 可能被小蓝熊检测", S(750), S(121), S(130),
-                            S(22), IDC_LBL_WARN);
-    SendMessageW(warn, WM_SETFONT, reinterpret_cast<WPARAM>(g.smallFont), TRUE);
+    MakeCheckbox(h, IDC_CHK_PATTERN, L"结构模式回退", S(750), S(116),
+                 S(130), S(34));
 
     // 差分定位 + 指针
     MakeButton(h, IDC_BTN_SCAN, L"① 扫描码率", S(14), S(162), S(120), S(32));
@@ -1803,12 +2161,14 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             LoadConfig();
             UpdateMonitorButton();
             Log(L"欢迎使用 VD码率修改器");
-            Log(L"流程: ① 扫描 → 改滑块后② → 改回后③ → ④ 生成指针 → 开始监控");
+            Log(L"流程: ① 扫描 → 改滑块后② → 改回后③ → ④ 生成指针 → 重启验证⑦ → 开始监控");
             Log(L"监控时每次 SteamVR 启动自动改码率，改完自动休眠；关闭窗口=隐藏到托盘");
-            if (!g.paths.empty()) {
+            if ((!g.paths.empty() && g.stableRounds >= kStableRoundsRequired) ||
+                (g.patternFallback && !g.valuePattern.empty())) {
                 ArmMonitor();
                 if (g.monitorThread)
-                    Log(L"已读取保存的 %zu 条指针路径，监控已自动开始", g.paths.size());
+                    Log(L"已读取保存的 %zu 条指针路径%s，监控已自动开始",
+                        g.paths.size(), g.valuePattern.empty() ? L"" : L"及结构模式");
             }
             return 0;
         }
@@ -1820,6 +2180,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             FillRect(dc, &rc, g.bgBrush);
             DrawTitleBar(dc);
             DrawStatusPill(dc);
+            DrawVersion(dc);
             EndPaint(h, &ps);
             return 0;
         }
@@ -1922,7 +2283,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                     }
                     break;
                 }
-                case IDC_BTN_PATCHALL: DoPatchAll();    break;
+                case IDC_BTN_VALIDATE: DoValidatePaths(); break;
                 case IDC_BTN_SCAN:     DoScan();        break;
                 case IDC_BTN_CHANGED:  DoChanged();     break;
                 case IDC_BTN_RESTORED: DoRestored();    break;
@@ -1958,6 +2319,18 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                         RestartMonitorAfterConfigChange();
                     break;
                 }
+                case IDC_CHK_PATTERN:
+                {
+                    g.patternFallback = SendMessageW(
+                        GetDlgItem(g.hwnd, IDC_CHK_PATTERN), BM_GETCHECK, 0,
+                        0) == BST_CHECKED;
+                    const bool saved = SaveConfig();
+                    if (saved && g.monitorThread)
+                        RestartMonitorAfterConfigChange();
+                    Log(L"[配置] 结构模式回退：%s",
+                        g.patternFallback ? L"开启" : L"关闭");
+                    break;
+                }
             }
             return 0;
         }
@@ -1985,10 +2358,16 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             }
             switch (job->kind) {
                 case JOB_SCAN: {
+                    const bool hadSavedPaths = !g.paths.empty();
                     g.scanner = std::move(job->scanner);
                     g.s1 = std::move(job->outMatches);
                     g.s2.clear();
                     g.s3.clear();
+                    g.valuePattern.clear();
+                    if (!hadSavedPaths) {
+                        g.stableRounds = 0;
+                        g.pathOriginPid = 0;
+                    }
                     HWND lv = GetDlgItem(h, IDC_LV_ADDR);
                     FillAddressList(lv, g.s1);
                     Log(L"步骤① 完成: 找到 %zu 处数值 = %lu", g.s1.size(),
@@ -2013,6 +2392,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                 case JOB_RESTORED: {
                     g.scanner = std::move(job->scanner);
                     g.s3 = std::move(job->outMatches);
+                    g.valuePattern = DeriveValuePattern(g.s3);
                     HWND lv = GetDlgItem(h, IDC_LV_ADDR);
                     FillAddressList(lv, g.s3);
                     Log(L"步骤③ 完成: 改回后仍保持 %lu 的地址 %zu 处 (即跟随滑块的活地址)",
@@ -2020,8 +2400,12 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                     if (g.s3.empty())
                         Log(L"结果为空: 请确认滑块确实改回了 %lu 的精确值，并重试②③",
                             job->from);
-                    else
+                    else {
                         Log(L"可以继续执行 ④ 查找指针路径");
+                        if (!g.valuePattern.empty())
+                            Log(L"[模式] 已识别连续字段布局 %s，重启后将作为指针失效时的回退定位",
+                                PatternToString(g.valuePattern).c_str());
+                    }
                     break;
                 }
                 case JOB_FINDPTR: {
@@ -2029,40 +2413,42 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
                     g.scanner = std::move(job->scanner);
                     g.paths = std::move(job->outPaths);
                     g.pathScores = std::move(job->outPathScores);
+                    g.stableRounds = 0;
+                    g.pathOriginPid = g.scanner ? g.scanner->Pid() : 0;
                     HWND lv = GetDlgItem(h, IDC_LV_PATH);
-                    ListView_DeleteAllItems(lv);
-                    for (size_t i = 0; i < g.paths.size(); ++i) {
-                        const PtrPath& p = g.paths[i];
-                        uintptr_t addr = 0;
-                        std::wstring val = L"解析失败";
-                        if (g.scanner && g.scanner->Resolve(p, &addr)) {
-                            uint32_t v = 0;
-                            if (g.scanner->Read32(addr, &v))
-                                val = std::to_wstring(v);
-                        }
-                        if (i < g.pathScores.size()) {
-                            val += L"  [联合分 ";
-                            val += std::to_wstring(g.pathScores[i]);
-                            val += L"]";
-                        }
-                        AddRow(lv, p.ToString(), val);
-                    }
-                    Log(L"④ 完成: 共 %zu 条静态指针路径。选中一条点⑤测试，然后点「开始监控」",
+                    FillPathList(lv, g.paths, &g.pathScores, g.scanner.get());
+                    Log(L"④ 完成: 共 %zu 条候选指针路径。可先点⑤测试；重启 VD/SteamVR 后重新完成①→③，再点⑦验证稳定性",
                         g.paths.size());
                     if (wasMonitoring)
                         RestartMonitorAfterConfigChange();
                     break;
                 }
-                case JOB_PATCHALL: {
+                case JOB_VALIDATE: {
                     g.scanner = std::move(job->scanner);
-                    Log(L"[全量] 已修改 %d 处内存 (%lu -> %lu)", job->patched,
-                        job->from, job->to);
-                    if (job->truncated)
-                        Log(L"[全量] 结果超过 %zu 条已截断，未改完。",
-                            kMaxScanResults);
-                    if (job->patched == 0)
-                        Log(L"[全量] 未找到数值 %lu (请先确认 VD 码率滑块停在 %lu)",
-                            job->from, job->from);
+                    if (g.scanner)
+                        g.pathOriginPid = g.scanner->Pid();
+                    g.paths = std::move(job->outPaths);
+                    g.pathScores = std::move(job->outPathScores);
+                    if (!g.paths.empty())
+                        ++g.stableRounds;
+                    else
+                        g.stableRounds = 0;
+                    const int shownRounds = g.stableRounds;
+                    SaveConfig();
+                    HWND lv = GetDlgItem(h, IDC_LV_PATH);
+                    FillPathList(lv, g.paths, &g.pathScores, nullptr, shownRounds);
+                    if (g.paths.empty()) {
+                        Log(L"[验证] 本轮没有路径通过重启验证（%zu/%zu 个叶地址匹配），稳定轮数已重置为 0",
+                            job->validatedLeaves, job->inLeaves.size());
+                    } else if (g.stableRounds >= kStableRoundsRequired) {
+                        Log(L"[验证] 第 %d 轮通过（%zu/%zu 个叶地址），已有路径连续通过 %d 轮重启验证，可作为稳定指针保存",
+                            g.stableRounds, job->validatedLeaves, job->inLeaves.size(),
+                            g.stableRounds);
+                    } else {
+                        Log(L"[验证] 第 %d 轮通过（%zu/%zu 个叶地址），保留 %zu 条候选；请再次重启 VD/SteamVR 并重新完成①→③后再点击⑦",
+                            g.stableRounds, job->validatedLeaves, job->inLeaves.size(),
+                            g.paths.size());
+                    }
                     break;
                 }
             }
